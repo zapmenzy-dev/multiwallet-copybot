@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-MULTI-WALLET COPY TRADER - Final Clean Version
-- Fixed Parsing
-- Daily Loss Removed
-- HEAD Request Support
+MULTI-WALLET COPY TRADER
 """
 
 import os
@@ -49,7 +46,7 @@ MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.30"))
 MAX_EXPOSURE       = 0.85
 MAX_PER_TRADE      = 0.22
 MIN_TRADE_SIZE     = 0.05
-MIN_SOURCE_SIZE    = 1.0          # Copy positions >= $1
+MIN_SOURCE_SIZE    = 1.0
 
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 48
@@ -88,8 +85,6 @@ class RobustBalanceManager:
         global peak_bankroll
         if not force and time.time() - self.last_update < 60 and self.cached_balance > 0:
             return self.cached_balance
-
-        # RPC logic (simplified)
         return self.cached_balance
 
 
@@ -102,7 +97,6 @@ class PolymarketExecutor:
         if self.dry_run:
             logging.info(f"[DRY RUN] BUY ${amount:.2f}")
             return True, "dry-run"
-        # Add real client logic later
         return False, ""
 
 
@@ -199,10 +193,10 @@ class CopyTrader:
                             token_id=token_id, entry_price=mid_price, size_usd=my_size,
                             shares=shares, source_wallet=wallet_addr, source_name=config["name"]
                         )
-                        logging.info(f"✅ COPIED ${my_size:.2f} → {question[:60]}")
+                        logging.info(f"COPIED ${my_size:.2f} → {question[:60]}")
 
     async def run(self):
-        logging.info("Bot started — Daily Loss Removed | Min Source $1+")
+        logging.info("Bot started")
         while True:
             try:
                 await self.scan_and_copy()
@@ -211,7 +205,7 @@ class CopyTrader:
             await asyncio.sleep(POLL_INTERVAL)
 
 
-# ==================== DASHBOARD + HEAD SUPPORT ====================
+# ==================== DASHBOARD SERVER ====================
 def run_dashboard():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -222,15 +216,14 @@ def run_dashboard():
                 try:
                     bankroll = bot.balance.cached_balance
                     html = f"""
-                    <h1>🤖 CopyTrader Status: ✅ RUNNING</h1>
-                    <p><strong>Bankroll:</strong> ${bankroll:.4f}</p>
-                    <p><strong>Open Positions:</strong> {len(bot.positions)}</p>
-                    <p><strong>Mode:</strong> {'LIVE' if not bot.dry_run else 'DRY RUN'}</p>
-                    <p><strong>Last Updated:</strong> {datetime.now().strftime('%H:%M:%S')}</p>
+                    <h1>CopyTrader Status: RUNNING</h1>
+                    <p>Bankroll: ${bankroll:.4f}</p>
+                    <p>Open Positions: {len(bot.positions)}</p>
+                    <p>Mode: {'LIVE' if not bot.dry_run else 'DRY RUN'}</p>
                     """
                     self.wfile.write(html.encode())
                 except:
-                    self.wfile.write(b"<h1>CopyTrader Running</h1>")
+                    self.wfile.write(b"OK")
             else:
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
@@ -244,7 +237,7 @@ def run_dashboard():
             pass
 
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
-    logging.info(f"✅ Dashboard & Health Server Started on port {HEALTH_PORT}")
+    logging.info(f"Dashboard server running on port {HEALTH_PORT}")
     server.serve_forever()
 
 
