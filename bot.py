@@ -5,19 +5,19 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY
 - Real Mid-Price Fetching
 - Full Buy + Sell Copying
 - 20% Drawdown Protection
-- Improved Balance Fetching + Robust Error Handling & Retries
+- Live Wallet Balance (no hardcoded bankroll)
+- Debug Logging for API responses
 - Health endpoint for Render (keeps bot awake)
 """
 
 import os
-import json
 import asyncio
 import requests
 import logging
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -50,18 +50,18 @@ POLY_API_KEY     = os.getenv("POLY_API_KEY", "")
 POLY_SECRET      = os.getenv("POLY_SECRET", "")
 POLY_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
-INITIAL_BANKROLL  = 10.0
-MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", "8"))
-POLL_INTERVAL     = int(os.getenv("POLL_SECONDS", "40"))
-COMPOUNDING_RATE  = float(os.getenv("COMPOUNDING_RATE", "0.70"))
-MAX_DRAWDOWN      = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-HEALTH_PORT       = int(os.getenv("PORT", "8080"))
-PAUSE_HOURS       = 48
-MAX_RETRIES       = 3
-RETRY_DELAY       = 5
+MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS", "8"))
+POLL_INTERVAL    = int(os.getenv("POLL_SECONDS", "40"))
+COMPOUNDING_RATE = float(os.getenv("COMPOUNDING_RATE", "0.70"))
+MAX_DRAWDOWN     = float(os.getenv("MAX_DRAWDOWN", "0.20"))
+HEALTH_PORT      = int(os.getenv("PORT", "8080"))
+PAUSE_HOURS      = 48
+MAX_RETRIES      = 3
+RETRY_DELAY      = 5
 
-current_bankroll  = INITIAL_BANKROLL
-peak_bankroll     = INITIAL_BANKROLL
+# These are set dynamically from real wallet balance on first scan
+current_bankroll: float = 0.0
+peak_bankroll:    float = 0.0
 bot_paused_until: Optional[datetime] = None
 
 
@@ -104,41 +104,66 @@ class Position:
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     def __init__(self):
-        self.cached_balance = INITIAL_BANKROLL
+        self.cached_balance = 0.0
         self.last_update    = 0
-        self.peak_balance   = INITIAL_BANKROLL
+        self.peak_balance   = 0.0
+        self.initialized    = False
 
     def _fetch_balance(self) -> float:
-        methods = [
-            lambda: requests.get(
-                f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}", timeout=8
-            ),
-            lambda: requests.get(
-                f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}", timeout=8
-            ),
+        """
+        Try multiple Polymarket API endpoints to get real USDC balance.
+        Logs the raw response so you can see exactly what comes back.
+        """
+        endpoints = [
+            f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}",
+            f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}",
+            f"https://data-api.polymarket.com/value?user={YOUR_WALLET}",
         ]
-        for method in methods:
+
+        for url in endpoints:
             try:
-                resp = method()
+                resp = requests.get(url, timeout=8)
+                logging.info(f"[BALANCE] {url.split('?')[0].split('/')[-1]} → status={resp.status_code} body={resp.text[:120]}")
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, (int, float)):
                         return float(data)
-                    elif isinstance(data, dict):
-                        val = data.get("balance") or data.get("portfolioValue") or 0
+                    elif isinstance(data, list) and len(data) > 0:
+                        # some endpoints return a list with one object
+                        item = data[0]
+                        val = item.get("balance") or item.get("portfolioValue") or item.get("value") or 0
                         return float(val)
-            except Exception:
+                    elif isinstance(data, dict):
+                        val = (
+                            data.get("balance")
+                            or data.get("portfolioValue")
+                            or data.get("value")
+                            or data.get("cashBalance")
+                            or 0
+                        )
+                        return float(val)
+            except Exception as e:
+                logging.warning(f"[BALANCE] Failed to fetch from {url}: {e}")
                 continue
+
+        logging.warning("[BALANCE] All endpoints failed — using cached balance")
         return 0.0
 
     def get_balance(self, force=False) -> float:
-        if force or (time.time() - self.last_update > 30):
+        global peak_bankroll
+        if force or not self.initialized or (time.time() - self.last_update > 60):
             real = self._fetch_balance()
             if real > 0:
                 self.cached_balance = real
                 self.last_update    = time.time()
+                self.initialized    = True
                 if real > self.peak_balance:
                     self.peak_balance = real
+                    peak_bankroll     = real
+                logging.info(f"[BALANCE] Live wallet balance: ${real:.4f} USDC")
+            else:
+                if not self.initialized:
+                    logging.warning("[BALANCE] Could not fetch real balance yet — waiting for next poll")
         return self.cached_balance
 
     def check_drawdown(self) -> Tuple[bool, float]:
@@ -151,19 +176,17 @@ class RobustBalanceManager:
 
 # ==================== EXECUTOR ====================
 class PolymarketExecutor:
-    """Wraps py-clob-client for real order placement."""
-
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
         self.client  = None
         if not dry_run and CLOB_AVAILABLE and YOUR_PRIVATE_KEY:
             try:
                 self.client = ClobClient(
-                    host       = "https://clob.polymarket.com",
-                    key        = YOUR_PRIVATE_KEY,
-                    chain_id   = POLYGON,
-                    api_key    = POLY_API_KEY,
-                    api_secret = POLY_SECRET,
+                    host           = "https://clob.polymarket.com",
+                    key            = YOUR_PRIVATE_KEY,
+                    chain_id       = POLYGON,
+                    api_key        = POLY_API_KEY,
+                    api_secret     = POLY_SECRET,
                     api_passphrase = POLY_PASSPHRASE,
                 )
                 logging.info("ClobClient initialised — LIVE mode")
@@ -177,8 +200,8 @@ class PolymarketExecutor:
             return True, "dry-run-buy"
         for attempt in range(MAX_RETRIES):
             try:
-                args   = MarketOrderArgs(token_id=token_id, amount=amount_usd)
-                result = self.client.create_and_post_order(args)
+                args     = MarketOrderArgs(token_id=token_id, amount=amount_usd)
+                result   = self.client.create_and_post_order(args)
                 order_id = result.get("orderID", "unknown")
                 logging.info(f"BUY placed: {order_id}")
                 return True, order_id
@@ -193,8 +216,8 @@ class PolymarketExecutor:
             return True, "dry-run-sell"
         for attempt in range(MAX_RETRIES):
             try:
-                args   = MarketOrderArgs(token_id=token_id, amount=shares)
-                result = self.client.create_and_post_order(args)
+                args     = MarketOrderArgs(token_id=token_id, amount=shares)
+                result   = self.client.create_and_post_order(args)
                 order_id = result.get("orderID", "unknown")
                 logging.info(f"SELL placed: {order_id}")
                 return True, order_id
@@ -214,6 +237,7 @@ class CopyTrader:
 
         logging.info(f"Multi-Wallet CopyTrader started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(f"Watching {len(WALLETS)} wallets | max positions={MAX_POSITIONS}")
+        logging.info(f"Your wallet: {YOUR_WALLET[:10]}..." if YOUR_WALLET else "[BALANCE] WARNING: DEPOSIT_WALLET_ADDRESS not set!")
 
     def get_mid_price(self, token_id: str) -> float:
         for attempt in range(MAX_RETRIES):
@@ -251,7 +275,9 @@ class CopyTrader:
         current = self.balance.get_balance()
         if current > peak_bankroll:
             peak_bankroll = current
-        dd = (peak_bankroll - current) / peak_bankroll if peak_bankroll > 0 else 0
+        if peak_bankroll == 0:
+            return False
+        dd = (peak_bankroll - current) / peak_bankroll
         if dd >= MAX_DRAWDOWN:
             if bot_paused_until is None or datetime.now() > bot_paused_until:
                 bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
@@ -264,12 +290,15 @@ class CopyTrader:
     def _get_positions(self, wallet_addr: str) -> Optional[list]:
         for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.get(
-                    f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50",
-                    timeout=12,
-                )
+                url  = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=50"
+                resp = requests.get(url, timeout=12)
+                logging.info(f"[DEBUG] positions API status={resp.status_code} wallet={wallet_addr[:10]}...")
                 if resp.status_code == 200:
-                    return resp.json()
+                    data = resp.json()
+                    logging.info(f"[DEBUG] response type={type(data).__name__} len={len(data) if isinstance(data, list) else 'N/A'}")
+                    return data
+                else:
+                    logging.warning(f"[DEBUG] Non-200 response: {resp.status_code} body={resp.text[:200]}")
             except Exception as e:
                 logging.warning(f"Position fetch attempt {attempt+1} failed for {wallet_addr}: {e}")
                 time.sleep(RETRY_DELAY)
@@ -286,8 +315,14 @@ class CopyTrader:
         if self.check_drawdown():
             return
 
-        current_bankroll = self.balance.get_balance()
-        logging.info(f"Scanning | bankroll=${current_bankroll:.2f} | open={len(self.positions)}")
+        # Always read live wallet balance
+        current_bankroll = self.balance.get_balance(force=True)
+
+        if current_bankroll <= 0:
+            logging.warning("Bankroll is $0 or unavailable — skipping scan until balance is fetched")
+            return
+
+        logging.info(f"Scanning | bankroll=${current_bankroll:.4f} | open={len(self.positions)}")
 
         for wallet_addr, config in WALLETS.items():
             raw = self._get_positions(wallet_addr)
@@ -295,15 +330,29 @@ class CopyTrader:
                 logging.warning(f"Skipping {config['name']} — could not fetch positions")
                 continue
 
+            # ---- DEBUG: show what API returned ----
+            logging.info(f"[DEBUG] {config['name']} ({wallet_addr[:10]}…) returned {len(raw)} positions")
+            if len(raw) == 0:
+                logging.info(f"[DEBUG] {config['name']} — wallet has NO open positions right now")
+            else:
+                for i, p in enumerate(raw[:5]):
+                    logging.info(
+                        f"[DEBUG] {config['name']} pos[{i}]: "
+                        f"asset={str(p.get('asset','?'))[:12]}… "
+                        f"value={p.get('value','?')} "
+                        f"title={str(p.get('title','?'))[:40]} "
+                        f"outcome={p.get('outcome','?')}"
+                    )
+
             source_token_ids = set()
 
             # ---- BUY LOGIC ----
             for pos in raw:
-                token_id   = pos.get("asset", "")
-                market_id  = pos.get("market", "")
-                question   = pos.get("title", "Unknown")
-                outcome    = pos.get("outcome", "YES")
-                size_usd   = float(pos.get("value", 0))
+                token_id  = pos.get("asset", "")
+                market_id = pos.get("market", "")
+                question  = pos.get("title", "Unknown")
+                outcome   = pos.get("outcome", "YES")
+                size_usd  = float(pos.get("value", 0))
 
                 if not token_id or size_usd < 1.0:
                     continue
@@ -322,8 +371,8 @@ class CopyTrader:
                 if mid_price <= 0:
                     continue
 
-                risk_pct  = self.get_risk_percent(mid_price, config)
-                my_size   = round(current_bankroll * risk_pct, 2)
+                risk_pct = self.get_risk_percent(mid_price, config)
+                my_size  = round(current_bankroll * risk_pct, 2)
 
                 if my_size < 1.0:
                     logging.info(f"Size too small (${my_size:.2f}) — skipping {question[:40]}")
@@ -379,7 +428,6 @@ class CopyTrader:
 
 # ==================== ENTRY POINT ====================
 async def main():
-    # Start health server in background thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
