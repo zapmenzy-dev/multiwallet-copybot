@@ -5,7 +5,7 @@ MULTI-WALLET COPY TRADER - PRODUCTION READY
 - Real Mid-Price Fetching
 - Full Buy + Sell Copying
 - 20% Drawdown Protection
-- Live Wallet Balance (no hardcoded bankroll)
+- On-chain USDC balance via Polygon RPC (no hardcoded bankroll)
 - Debug Logging for API responses
 - Health endpoint for Render (keeps bot awake)
 """
@@ -59,10 +59,18 @@ PAUSE_HOURS      = 48
 MAX_RETRIES      = 3
 RETRY_DELAY      = 5
 
-# These are set dynamically from real wallet balance on first scan
+# Set dynamically from real wallet on first scan
 current_bankroll: float = 0.0
 peak_bankroll:    float = 0.0
 bot_paused_until: Optional[datetime] = None
+
+# USDC.e contract on Polygon
+USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+POLYGON_RPCS  = [
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://rpc-mainnet.matic.network",
+]
 
 
 # ==================== HEALTH SERVER ====================
@@ -74,7 +82,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK - CopyTrader running")
 
     def log_message(self, format, *args):
-        pass  # suppress noisy access logs
+        pass
 
 
 def run_health_server():
@@ -109,50 +117,63 @@ class RobustBalanceManager:
         self.peak_balance   = 0.0
         self.initialized    = False
 
-    def _fetch_balance(self) -> float:
-        """
-        Try multiple Polymarket API endpoints to get real USDC balance.
-        Logs the raw response so you can see exactly what comes back.
-        """
-        endpoints = [
-            f"https://data-api.polymarket.com/balance?user={YOUR_WALLET}",
-            f"https://data-api.polymarket.com/profile?user={YOUR_WALLET}",
-            f"https://data-api.polymarket.com/value?user={YOUR_WALLET}",
-        ]
+    def _fetch_onchain(self) -> float:
+        """Read USDC.e balance directly from Polygon blockchain via RPC."""
+        if not YOUR_WALLET:
+            logging.warning("[BALANCE] DEPOSIT_WALLET_ADDRESS not set")
+            return 0.0
 
-        for url in endpoints:
+        padded = YOUR_WALLET.lower().replace("0x", "").zfill(64)
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "eth_call",
+            "params":  [
+                {
+                    "to":   USDC_CONTRACT,
+                    "data": "0x70a08231" + padded,
+                },
+                "latest",
+            ],
+            "id": 1,
+        }
+
+        for rpc in POLYGON_RPCS:
             try:
-                resp = requests.get(url, timeout=8)
-                logging.info(f"[BALANCE] {url.split('?')[0].split('/')[-1]} → status={resp.status_code} body={resp.text[:120]}")
+                resp = requests.post(rpc, json=payload, timeout=8)
+                logging.info(f"[BALANCE] RPC {rpc.split('//')[-1]} → status={resp.status_code}")
                 if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, (int, float)):
-                        return float(data)
-                    elif isinstance(data, list) and len(data) > 0:
-                        # some endpoints return a list with one object
-                        item = data[0]
-                        val = item.get("balance") or item.get("portfolioValue") or item.get("value") or 0
-                        return float(val)
-                    elif isinstance(data, dict):
-                        val = (
-                            data.get("balance")
-                            or data.get("portfolioValue")
-                            or data.get("value")
-                            or data.get("cashBalance")
-                            or 0
-                        )
-                        return float(val)
+                    result = resp.json().get("result", "0x0")
+                    if result and result != "0x":
+                        raw     = int(result, 16)
+                        balance = raw / 1_000_000  # USDC has 6 decimals
+                        logging.info(f"[BALANCE] On-chain USDC balance: ${balance:.4f}")
+                        return balance
             except Exception as e:
-                logging.warning(f"[BALANCE] Failed to fetch from {url}: {e}")
+                logging.warning(f"[BALANCE] RPC {rpc} failed: {e}")
                 continue
 
-        logging.warning("[BALANCE] All endpoints failed — using cached balance")
+        # Fallback: try Polymarket data API
+        logging.warning("[BALANCE] All RPC endpoints failed — trying Polymarket API fallback")
+        try:
+            url  = f"https://data-api.polymarket.com/value?user={YOUR_WALLET}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                logging.info(f"[BALANCE] API fallback body: {resp.text[:200]}")
+                if isinstance(data, list) and len(data) > 0:
+                    for key in ["cashBalance", "balance", "portfolioValue", "usdcBalance"]:
+                        val = data[0].get(key)
+                        if val is not None and float(val) > 0:
+                            return float(val)
+        except Exception as e:
+            logging.warning(f"[BALANCE] API fallback failed: {e}")
+
         return 0.0
 
     def get_balance(self, force=False) -> float:
         global peak_bankroll
         if force or not self.initialized or (time.time() - self.last_update > 60):
-            real = self._fetch_balance()
+            real = self._fetch_onchain()
             if real > 0:
                 self.cached_balance = real
                 self.last_update    = time.time()
@@ -160,10 +181,9 @@ class RobustBalanceManager:
                 if real > self.peak_balance:
                     self.peak_balance = real
                     peak_bankroll     = real
-                logging.info(f"[BALANCE] Live wallet balance: ${real:.4f} USDC")
             else:
                 if not self.initialized:
-                    logging.warning("[BALANCE] Could not fetch real balance yet — waiting for next poll")
+                    logging.warning("[BALANCE] Could not fetch real balance yet — will retry next poll")
         return self.cached_balance
 
     def check_drawdown(self) -> Tuple[bool, float]:
@@ -237,7 +257,7 @@ class CopyTrader:
 
         logging.info(f"Multi-Wallet CopyTrader started | mode={'DRY RUN' if dry_run else 'LIVE'}")
         logging.info(f"Watching {len(WALLETS)} wallets | max positions={MAX_POSITIONS}")
-        logging.info(f"Your wallet: {YOUR_WALLET[:10]}..." if YOUR_WALLET else "[BALANCE] WARNING: DEPOSIT_WALLET_ADDRESS not set!")
+        logging.info(f"Your proxy wallet: {YOUR_WALLET[:10]}..." if YOUR_WALLET else "WARNING: DEPOSIT_WALLET_ADDRESS not set!")
 
     def get_mid_price(self, token_id: str) -> float:
         for attempt in range(MAX_RETRIES):
@@ -330,7 +350,7 @@ class CopyTrader:
                 logging.warning(f"Skipping {config['name']} — could not fetch positions")
                 continue
 
-            # ---- DEBUG: show what API returned ----
+            # ---- DEBUG ----
             logging.info(f"[DEBUG] {config['name']} ({wallet_addr[:10]}…) returned {len(raw)} positions")
             if len(raw) == 0:
                 logging.info(f"[DEBUG] {config['name']} — wallet has NO open positions right now")
@@ -361,7 +381,7 @@ class CopyTrader:
                 pos_key = f"{wallet_addr}_{token_id}"
 
                 if pos_key in self.positions:
-                    continue  # already copied
+                    continue
 
                 if len(self.positions) >= MAX_POSITIONS:
                     logging.info("Max positions reached — skipping new entries")
