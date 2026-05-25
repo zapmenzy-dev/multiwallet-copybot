@@ -52,18 +52,16 @@ MIN_SOURCE_SIZE    = 1.0                                         # only copy sou
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24                                          # pause 24h on drawdown
 
-# Polymarket uses PUSD (their wrapped stablecoin) as trading collateral.
-# PUSD contract on Polygon — 6 decimals, same as USDC.
-# We also check the CTF Exchange escrow in case funds are mid-trade,
-# and USDC.e / native USDC for wallets that haven't converted yet.
+# pUSD is Polymarket's collateral token (ERC-20, 6 decimals) on Polygon.
+# Confirmed contract: 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
+# We also check the CTF Exchange escrow for funds locked mid-trade.
 POLYGON_RPCS  = ["https://rpc.ankr.com/polygon", "https://polygon-bor-rpc.publicnode.com"]
 BALANCE_OF_SELECTOR = "0x70a08231"
 USDC_CONTRACTS = [
-    ("PUSD",             "0x4Fabb145d64652a948d72533023f6E7A623C7C53", 6),  # Polymarket collateral
+    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),  # Polymarket collateral ✓
     ("CTF-Exchange",     "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", 6),  # trading escrow
     ("NegRisk-Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a", 6),  # multi-outcome escrow
-    ("USDC.e",           "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),  # bridged USDC fallback
-    ("USDC",             "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),  # native USDC fallback
+    ("USDC.e",           "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),  # legacy fallback
 ]
 
 peak_bankroll: float = BANKROLL_FALLBACK
@@ -111,64 +109,77 @@ class RobustBalanceManager:
 
     # ── RPC helpers ──────────────────────────────────────────────────────────
 
-    def _batch_payload(self, wallet: str) -> list[dict]:
-        """Build a JSON-RPC batch request for all USDC contracts at once."""
+    def _call_payload(self, contract: str, wallet: str) -> dict:
         padded = wallet.lower().replace("0x", "").zfill(64)
-        data   = BALANCE_OF_SELECTOR + padded
-        return [
-            {
-                "jsonrpc": "2.0",
-                "id": idx,
-                "method": "eth_call",
-                "params": [{"to": contract, "data": data}, "latest"],
-            }
-            for idx, (_, contract, _) in enumerate(USDC_CONTRACTS)
-        ]
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": contract, "data": BALANCE_OF_SELECTOR + padded}, "latest"],
+        }
+
+    async def _query_contract(
+        self,
+        session: aiohttp.ClientSession,
+        rpc_url: str,
+        label: str,
+        contract: str,
+        decimals: int,
+        wallet: str,
+    ) -> Optional[float]:
+        """Single balanceOf call. Returns None on network error, 0.0 on zero balance."""
+        try:
+            async with session.post(
+                rpc_url,
+                json=self._call_payload(contract, wallet),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                hex_val = data.get("result") or "0x0"
+                if not hex_val or hex_val == "0x":
+                    return 0.0
+                return int(hex_val, 16) / (10 ** decimals)
+        except Exception as e:
+            logging.debug(f"  {label} @ {rpc_url}: {e}")
+            return None
 
     async def _fetch_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
-        payload = self._batch_payload(wallet)
+        """
+        Query each contract individually (no batching -- more compatible with
+        public nodes). Tries RPC nodes in order; stops at first responsive node.
+        Returns the summed balance, 0.0 for a valid empty wallet, or None if
+        all nodes are unreachable.
+        """
         for rpc_url in POLYGON_RPCS:
-            try:
-                async with session.post(
-                    rpc_url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    results = await resp.json(content_type=None)
-                    if not isinstance(results, list):
-                        results = [results]
+            total = 0.0
+            breakdown: dict[str, float] = {}
+            rpc_alive = False
 
-                    total = 0.0
-                    breakdown: dict[str, float] = {}
-                    for item in results:
-                        idx = item.get("id", 0)
-                        hex_val = (item.get("result") or "0x0")
-                        if not hex_val or hex_val == "0x":
-                            hex_val = "0x0"
-                        label, _, decimals = USDC_CONTRACTS[idx]
-                        raw = int(hex_val, 16)
-                        amount = raw / (10 ** decimals)
-                        if amount > 0:
-                            breakdown[label] = amount
-                            total += amount
+            for label, contract, decimals in USDC_CONTRACTS:
+                amount = await self._query_contract(
+                    session, rpc_url, label, contract, decimals, wallet
+                )
+                if amount is None:
+                    continue  # this contract call failed, try next
+                rpc_alive = True
+                if amount > 0:
+                    breakdown[label] = amount
+                    total += amount
 
-                    if total > 0:
-                        self._breakdown = breakdown
-                        parts = ", ".join(f"{k}=${v:.2f}" for k, v in breakdown.items())
-                        logging.info(f"RPC balance: ${total:.4f} ({parts}) via {rpc_url}")
-                        return total
-
-                    # All contracts returned 0 — still valid, just empty wallet
+            if rpc_alive:
+                self._breakdown = breakdown
+                if total > 0:
+                    parts = ", ".join(f"{k}=${v:.4f}" for k, v in breakdown.items())
+                    logging.info(f"RPC balance: ${total:.4f} ({parts}) via {rpc_url}")
+                else:
                     logging.info(f"RPC balance: $0.0000 (all contracts zero) via {rpc_url}")
-                    self._breakdown = {}
-                    return 0.0
+                return total
 
-            except Exception as e:
-                logging.warning(f"RPC {rpc_url} failed: {e}")
+            logging.warning(f"RPC {rpc_url} unreachable — trying next")
 
-        return None  # all RPCs unreachable
+        return None  # all RPC nodes unreachable
 
     # ── Polymarket API fallback ───────────────────────────────────────────────
 
