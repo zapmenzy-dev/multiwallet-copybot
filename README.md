@@ -1,0 +1,1 @@
+# multiwallet-copybot
