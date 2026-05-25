@@ -65,7 +65,7 @@ peak_bankroll:    float = 0.0
 bot_paused_until: Optional[datetime] = None
 
 # USDC.e contract on Polygon
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 POLYGON_RPCS  = [
     "https://polygon-rpc.com",
     "https://rpc.ankr.com/polygon",
