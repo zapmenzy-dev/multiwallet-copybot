@@ -1,0 +1,4 @@
+aiohttp
+requests
+python-dotenv
+py-clob-client
