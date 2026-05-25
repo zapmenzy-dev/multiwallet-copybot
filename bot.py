@@ -19,8 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_LOG_LEVEL = logging.DEBUG if os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -52,16 +53,20 @@ MIN_SOURCE_SIZE    = 1.0                                         # only copy sou
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24                                          # pause 24h on drawdown
 
-# pUSD is Polymarket's collateral token (ERC-20, 6 decimals) on Polygon.
-# Confirmed contract: 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
-# We also check the CTF Exchange escrow for funds locked mid-trade.
-POLYGON_RPCS  = ["https://rpc.ankr.com/polygon", "https://polygon-bor-rpc.publicnode.com"]
+# Polymarket contract addresses — source: docs.polymarket.com/resources/contracts
+# pUSD is held directly in the wallet as an ERC-20 token.
+# CTF/NegRisk exchanges hold pUSD as escrow while positions are open.
+POLYGON_RPCS  = [
+    "https://polygon-bor-rpc.publicnode.com",   # tried first (no batch issues)
+    "https://rpc.ankr.com/polygon",
+    "https://polygon-rpc.com",
+]
 BALANCE_OF_SELECTOR = "0x70a08231"
-USDC_CONTRACTS = [
-    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),  # Polymarket collateral ✓
-    ("CTF-Exchange",     "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", 6),  # trading escrow
-    ("NegRisk-Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a", 6),  # multi-outcome escrow
-    ("USDC.e",           "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),  # legacy fallback
+PUSD_CONTRACTS = [
+    # label,              address,                                      decimals
+    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),  # wallet balance
+    ("CTF-v2",           "0xE111180000d2663C0091e4f400237545B87B996B", 6),  # v2 trading escrow
+    ("NegRisk-v2",       "0xe2222d279d744050d28e00520010520000310F59", 6),  # v2 neg-risk escrow
 ]
 
 peak_bankroll: float = BANKROLL_FALLBACK
@@ -127,20 +132,36 @@ class RobustBalanceManager:
         decimals: int,
         wallet: str,
     ) -> Optional[float]:
-        """Single balanceOf call. Returns None on network error, 0.0 on zero balance."""
+        """
+        Single balanceOf call.
+        Returns float (0.0 or greater) on success, None on network/RPC error.
+        """
         try:
+            payload = self._call_payload(contract, wallet)
             async with session.post(
                 rpc_url,
-                json=self._call_payload(contract, wallet),
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
+                text = await resp.text()
                 if resp.status != 200:
+                    logging.debug(f"  {label}: HTTP {resp.status} — {text[:120]}")
                     return None
-                data = await resp.json(content_type=None)
+                # Parse carefully — some nodes return errors inside a 200
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    import json
+                    data = json.loads(text)
+                if "error" in data:
+                    logging.debug(f"  {label}: RPC error {data['error']}")
+                    return None
                 hex_val = data.get("result") or "0x0"
-                if not hex_val or hex_val == "0x":
+                if not hex_val or hex_val in ("0x", "0x0"):
                     return 0.0
-                return int(hex_val, 16) / (10 ** decimals)
+                amount = int(hex_val, 16) / (10 ** decimals)
+                logging.debug(f"  {label}: ${amount:.6f}")
+                return amount
         except Exception as e:
             logging.debug(f"  {label} @ {rpc_url}: {e}")
             return None
@@ -152,12 +173,13 @@ class RobustBalanceManager:
         Returns the summed balance, 0.0 for a valid empty wallet, or None if
         all nodes are unreachable.
         """
+        logging.debug(f"Fetching balance for wallet {wallet}")
         for rpc_url in POLYGON_RPCS:
             total = 0.0
             breakdown: dict[str, float] = {}
             rpc_alive = False
 
-            for label, contract, decimals in USDC_CONTRACTS:
+            for label, contract, decimals in PUSD_CONTRACTS:
                 amount = await self._query_contract(
                     session, rpc_url, label, contract, decimals, wallet
                 )
@@ -229,6 +251,10 @@ class RobustBalanceManager:
         if not YOUR_WALLET:
             logging.warning("DEPOSIT_WALLET_ADDRESS not set — using cached/fallback balance")
             return self.cached_balance
+        if not YOUR_WALLET.startswith("0x") or len(YOUR_WALLET) != 42:
+            logging.error(f"DEPOSIT_WALLET_ADDRESS looks invalid: '{YOUR_WALLET}' — expected 0x + 40 hex chars")
+            return self.cached_balance
+        logging.debug(f"Balance check for {YOUR_WALLET}")
 
         # Strategy 1: RPC batch
         fetched = await self._fetch_rpc(session, YOUR_WALLET)
