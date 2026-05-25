@@ -52,12 +52,19 @@ MIN_SOURCE_SIZE    = 1.0                                         # only copy sou
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24                                          # pause 24h on drawdown
 
-# USDC on Polygon (6 decimals) — used for bankroll fetch via RPC
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+# All contracts that could hold your Polymarket USDC, checked in order:
+#   1. USDC.e  — bridged USDC, the token Polymarket's deposit UI sends
+#   2. Native USDC — newer Circle-issued USDC on Polygon
+#   3. Polymarket CTF Exchange — trading escrow (holds deposited collateral)
+#   4. Neg-risk CTF Exchange  — used for multi-outcome markets
 POLYGON_RPCS  = ["https://rpc.ankr.com/polygon", "https://polygon-bor-rpc.publicnode.com"]
-
-# ERC-20 balanceOf(address) selector
 BALANCE_OF_SELECTOR = "0x70a08231"
+USDC_CONTRACTS = [
+    ("USDC.e",           "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),
+    ("USDC",             "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
+    ("CTF-Exchange",     "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", 6),
+    ("NegRisk-Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a", 6),
+]
 
 peak_bankroll: float = BANKROLL_FALLBACK
 bot_paused_until: Optional[datetime] = None
@@ -84,49 +91,122 @@ class Position:
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    """Fetches USDC balance from Polygon via eth_call RPC."""
+    """
+    Fetches your tradeable USDC balance using three strategies in order:
+
+    1. RPC batch call — checks USDC.e, native USDC, CTF Exchange, and
+       NegRisk Exchange balances in a single eth_call batch per RPC node.
+       Sums all non-zero results (your funds may be split across contracts).
+
+    2. Polymarket data API — queries /value endpoint which returns your
+       portfolio value as Polymarket sees it. Good fallback if RPC is flaky.
+
+    3. Cached value — last successful read, or BANKROLL_FALLBACK from .env.
+    """
 
     def __init__(self):
         self.cached_balance = BANKROLL_FALLBACK
         self.last_update = 0
+        self._breakdown: dict[str, float] = {}   # label → amount for logging
 
-    def _build_call_payload(self, wallet: str) -> dict:
-        # Pad address to 32 bytes for balanceOf(address) ABI encoding
+    # ── RPC helpers ──────────────────────────────────────────────────────────
+
+    def _batch_payload(self, wallet: str) -> list[dict]:
+        """Build a JSON-RPC batch request for all USDC contracts at once."""
         padded = wallet.lower().replace("0x", "").zfill(64)
-        data = BALANCE_OF_SELECTOR + padded
-        return {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [
-                {"to": USDC_CONTRACT, "data": data},
-                "latest"
-            ]
-        }
+        data   = BALANCE_OF_SELECTOR + padded
+        return [
+            {
+                "jsonrpc": "2.0",
+                "id": idx,
+                "method": "eth_call",
+                "params": [{"to": contract, "data": data}, "latest"],
+            }
+            for idx, (_, contract, _) in enumerate(USDC_CONTRACTS)
+        ]
 
-    async def _fetch_from_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
-        payload = self._build_call_payload(wallet)
+    async def _fetch_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
+        payload = self._batch_payload(wallet)
         for rpc_url in POLYGON_RPCS:
             try:
                 async with session.post(
                     rpc_url,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=8)
+                    timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status != 200:
                         continue
-                    data = await resp.json(content_type=None)
-                    result = data.get("result", "0x0")
-                    if not result or result == "0x":
-                        continue
-                    raw = int(result, 16)
-                    # USDC uses 6 decimals
-                    balance = raw / 1_000_000
-                    logging.info(f"RPC balance fetched: ${balance:.4f} USDC (via {rpc_url})")
-                    return balance
+                    results = await resp.json(content_type=None)
+                    if not isinstance(results, list):
+                        results = [results]
+
+                    total = 0.0
+                    breakdown: dict[str, float] = {}
+                    for item in results:
+                        idx = item.get("id", 0)
+                        hex_val = (item.get("result") or "0x0")
+                        if not hex_val or hex_val == "0x":
+                            hex_val = "0x0"
+                        label, _, decimals = USDC_CONTRACTS[idx]
+                        raw = int(hex_val, 16)
+                        amount = raw / (10 ** decimals)
+                        if amount > 0:
+                            breakdown[label] = amount
+                            total += amount
+
+                    if total > 0:
+                        self._breakdown = breakdown
+                        parts = ", ".join(f"{k}=${v:.2f}" for k, v in breakdown.items())
+                        logging.info(f"RPC balance: ${total:.4f} ({parts}) via {rpc_url}")
+                        return total
+
+                    # All contracts returned 0 — still valid, just empty wallet
+                    logging.info(f"RPC balance: $0.0000 (all contracts zero) via {rpc_url}")
+                    self._breakdown = {}
+                    return 0.0
+
             except Exception as e:
                 logging.warning(f"RPC {rpc_url} failed: {e}")
+
+        return None  # all RPCs unreachable
+
+    # ── Polymarket API fallback ───────────────────────────────────────────────
+
+    async def _fetch_polymarket_api(
+        self, session: aiohttp.ClientSession, wallet: str
+    ) -> Optional[float]:
+        """
+        Query Polymarket's data API for the wallet's portfolio value.
+        This reflects deposited + unrealised value — a reasonable proxy for
+        available balance when RPC can't reach the chain.
+        """
+        try:
+            url = f"https://data-api.polymarket.com/value?user={wallet}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                # Response: {"portfolioValue": 123.45} or a float directly
+                if isinstance(data, (int, float)):
+                    value = float(data)
+                elif isinstance(data, dict):
+                    value = float(
+                        data.get("portfolioValue")
+                        or data.get("value")
+                        or data.get("balance")
+                        or 0
+                    )
+                else:
+                    return None
+
+                if value >= 0:
+                    logging.info(f"Polymarket API balance: ${value:.4f}")
+                    return value
+        except Exception as e:
+            logging.warning(f"Polymarket API balance fetch failed: {e}")
         return None
+
+    # ── Public interface ──────────────────────────────────────────────────────
 
     async def get(self, session: aiohttp.ClientSession, force: bool = False) -> float:
         global peak_bankroll
@@ -139,16 +219,31 @@ class RobustBalanceManager:
             logging.warning("DEPOSIT_WALLET_ADDRESS not set — using cached/fallback balance")
             return self.cached_balance
 
-        fetched = await self._fetch_from_rpc(session, YOUR_WALLET)
+        # Strategy 1: RPC batch
+        fetched = await self._fetch_rpc(session, YOUR_WALLET)
+
+        # Strategy 2: Polymarket API (if RPC totally failed)
+        if fetched is None:
+            fetched = await self._fetch_polymarket_api(session, YOUR_WALLET)
+
         if fetched is not None:
             self.cached_balance = fetched
             self.last_update = time.time()
             if fetched > peak_bankroll:
                 peak_bankroll = fetched
         else:
-            logging.warning("All RPCs failed — using cached balance")
+            logging.warning("All balance sources failed — using cached $%.4f", self.cached_balance)
 
         return self.cached_balance
+
+    def adjust(self, delta: float) -> None:
+        """
+        Instantly adjust the cached balance by delta (negative for spend,
+        positive for proceeds). Called right after each trade so sizing
+        decisions don't need to wait for the next RPC round-trip.
+        """
+        self.cached_balance = max(0.0, self.cached_balance + delta)
+        logging.debug(f"Balance adjusted by {delta:+.4f} → ${self.cached_balance:.4f}")
 
 
 # ==================== EXECUTOR ====================
@@ -427,8 +522,9 @@ class CopyTrader:
         price: float,
     ) -> tuple[bool, str]:
         """
-        Execute a buy or sell, then immediately refresh the cached balance via RPC
-        so the next trade decision uses an up-to-date bankroll.
+        Execute a buy or sell, then update the balance in two steps:
+          1. Instant local adjust (so next trade sizes correctly without waiting)
+          2. Async RPC confirm (overwrites with on-chain truth)
         """
         if action == "BUY":
             ok, oid = await self.executor.place_buy(token_id, size_usd, price)
@@ -436,8 +532,12 @@ class CopyTrader:
             ok, oid = await self.executor.place_sell(token_id, shares, price)
 
         if ok:
-            # Refresh balance right away — don't wait for next poll cycle
-            await self.balance.get(session, force=True)
+            # Step 1: immediately reflect spend/proceeds in cache
+            delta = -size_usd if action == "BUY" else size_usd
+            self.balance.adjust(delta)
+
+            # Step 2: confirm with on-chain RPC (non-blocking best-effort)
+            asyncio.ensure_future(self.balance.get(session, force=True))
 
         return ok, oid
 
@@ -573,9 +673,6 @@ class CopyTrader:
                     )
 
                     if ok:
-                        # Re-read bankroll after the trade for accurate next sizing
-                        bankroll = self.balance.cached_balance
-
                         self.positions[pos_key] = Position(
                             market_id    = "",
                             question     = question,
