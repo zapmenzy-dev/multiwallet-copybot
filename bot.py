@@ -599,35 +599,52 @@ class CopyTrader:
             logging.warning(f"_get_source_position error ({wallet_addr[:10]}…): {e}")
             return {"_network_error": True}
 
-    # -------- update PnL for current positions --------
+    # ========== FIXED: update PnL for current positions ==========
     
     async def update_positions_pnl(self, session: aiohttp.ClientSession):
         """
         Update PnL for all open positions based on current market prices.
         Uses Rust formulas for PnL calculation.
         """
+        if not self.positions:
+            logging.debug("No positions to update PnL for")
+            return
+        
+        open_positions = sum(1 for p in self.positions.values() if p.status == "open")
+        logging.info(f"Updating PnL for {open_positions} open positions")
+        
         for pos_key, pos in self.positions.items():
             if pos.status != "open":
                 continue
             
+            # Get current mid price for this position
             mid_price = await self.get_mid_price(session, pos.token_id)
             
             if mid_price > 0:
+                # Store previous price for logging
+                old_price = pos.current_price
                 pos.current_price = mid_price
                 
+                # Update peak price for trailing stop
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
                 if mid_price > pos.peak_price:
                     pos.peak_price = mid_price
                 
-                # Update pnl field using Rust formula
-                pos.pnl = pos.pnl_unrealized()
+                # Calculate unrealized PnL using Rust formula
+                unrealized = pos.pnl_unrealized()
                 
-                logging.debug(
-                    f"PnL UPDATE {pos.question[:40]} | "
-                    f"price={mid_price:.4f} entry={pos.entry_price:.4f} "
-                    f"unrealized PnL=${pos.pnl:+.2f} ({pos.pnl_pct():+.1f}%)"
+                # Store in pnl field
+                pos.pnl = unrealized
+                
+                logging.info(
+                    f"📊 PnL UPDATE | {pos.question[:35]} | "
+                    f"Entry: ${pos.entry_price:.4f} → Now: ${mid_price:.4f} | "
+                    f"Size: ${pos.size_usd:.2f} | "
+                    f"PnL: ${unrealized:+.2f} ({pos.pnl_pct():+.1f}%)"
                 )
+            else:
+                logging.warning(f"Could not get price for {pos.token_id[:12]}... | PnL not updated")
 
     # -------- execute + refresh --------
 
@@ -760,7 +777,7 @@ class CopyTrader:
                 f"exposure=${self._total_exposure():.2f}"
             )
 
-            # Update PnL for all open positions using Rust formulas
+            # Update PnL for all open positions using Rust formulas (FIXED)
             await self.update_positions_pnl(session)
             
             await self.scan_for_exits(session)
