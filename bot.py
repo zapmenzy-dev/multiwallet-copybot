@@ -36,9 +36,6 @@ WALLETS = {
 
 YOUR_PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 YOUR_WALLET      = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
-CLOB_API_KEY     = os.getenv("POLY_API_KEY", "")
-CLOB_SECRET      = os.getenv("POLY_SECRET", "")
-CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
 BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
 
@@ -54,14 +51,6 @@ LIMIT_ORDER_TICK   = 0.01
 
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24
-
-POLYGON_RPCS  = ["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"]
-BALANCE_OF_SELECTOR = "0x70a08231"
-PUSD_CONTRACTS = [
-    ("pUSD", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),
-    ("CTF-v2", "0xE111180000d2663C0091e4f400237545B87B996B", 6),
-    ("NegRisk-v2", "0xe2222d279d744050d28e00520010520000310F59", 6),
-]
 
 peak_bankroll: float = BANKROLL_FALLBACK
 bot_paused_until: Optional[datetime] = None
@@ -100,10 +89,6 @@ class RobustBalanceManager:
         if not force and time.time() - self.last_update < 60:
             return self.cached_balance
 
-        if not YOUR_WALLET:
-            return self.cached_balance
-
-        # Simple fallback for now
         self.cached_balance = BANKROLL_FALLBACK
         self.last_update = time.time()
         if self.cached_balance > peak_bankroll:
@@ -122,13 +107,13 @@ class PolymarketExecutor:
     async def place_limit_buy(self, token_id: str, amount_usd: float, best_ask: float):
         if self.dry_run:
             logging.info(f"[DRY RUN] BUY ${amount_usd:.2f}")
-            return True, "dry-run-success"
+            return True, "dry-success"
         return False, "live-not-implemented"
 
     async def place_sell(self, token_id: str, shares: float, price: float):
         if self.dry_run:
-            logging.info(f"[DRY RUN] SELL ${shares:.4f} shares")
-            return True, "dry-run-success"
+            logging.info(f"[DRY RUN] SELL shares")
+            return True, "dry-success"
         return False, "live-not-implemented"
 
 
@@ -140,8 +125,8 @@ class CopyTrader:
         self.executor = PolymarketExecutor(dry_run)
         self.balance = RobustBalanceManager()
 
-    # ==================== PnL UPDATE (Main Fix) ====================
     async def update_all_positions_pnl(self, session: aiohttp.ClientSession):
+        """Update current price and PnL for all open positions"""
         for pos in list(self.positions.values()):
             if pos.status != "open":
                 continue
@@ -150,7 +135,6 @@ class CopyTrader:
                 pos.current_price = mid
                 if pos.peak_price == 0 or mid > pos.peak_price:
                     pos.peak_price = mid
-                # Accurate PnL
                 if pos.side == "BUY":
                     pos.pnl = (mid - pos.entry_price) * pos.shares
                 else:
@@ -173,11 +157,12 @@ class CopyTrader:
 
     def _check_drawdown(self, bankroll: float) -> bool:
         global bot_paused_until
-        if peak_bankroll <= 0: return False
+        if peak_bankroll <= 0:
+            return False
         drawdown = (peak_bankroll - bankroll) / peak_bankroll
         if drawdown >= MAX_DRAWDOWN:
             bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
-            logging.warning(f"Drawdown {drawdown:.1%} — pausing bot")
+            logging.warning(f"Drawdown {drawdown:.1%} — bot paused")
             return True
         return False
 
@@ -185,14 +170,17 @@ class CopyTrader:
         try:
             url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
             async with session.get(url, timeout=12) as r:
-                if r.status != 200: return None
+                if r.status != 200:
+                    return None
                 data = await r.json()
                 cleaned = []
                 for p in data if isinstance(data, list) else []:
                     token_id = p.get("asset")
-                    if not token_id: continue
+                    if not token_id:
+                        continue
                     value = float(p.get("currentValue") or p.get("value") or 0)
-                    if value < MIN_SOURCE_SIZE: continue
+                    if value < MIN_SOURCE_SIZE:
+                        continue
                     side = (p.get("side") or "BUY").upper()
                     cleaned.append({
                         "asset": token_id,
@@ -221,32 +209,32 @@ class CopyTrader:
 
     async def get_mid_price(self, session: aiohttp.ClientSession, token_id: str) -> float:
         bb, ba = await self.get_orderbook(session, token_id)
-        if bb and ba: return (bb + ba) / 2
+        if bb and ba:
+            return (bb + ba) / 2
         return bb or ba or 0.0
 
     async def _execute_and_refresh(self, session, action, token_id, shares, size_usd, price, best_ask=0):
         if action == "BUY":
-            ok, oid = await self.executor.place_limit_buy(token_id, size_usd, best_ask or price)
+            ok, _ = await self.executor.place_limit_buy(token_id, size_usd, best_ask or price)
         else:
-            ok, oid = await self.executor.place_sell(token_id, shares, price)
+            ok, _ = await self.executor.place_sell(token_id, shares, price)
         if ok:
             delta = -size_usd if action == "BUY" else size_usd
             self.balance.adjust(delta)
-        return ok, oid
+        return ok, ""
 
-    # ==================== SCAN FOR EXITS ====================
     async def scan_for_exits(self, session):
         for pos_key, pos in list(self.positions.items()):
-            if pos.status != "open": continue
+            if pos.status != "open":
+                continue
             mid = await self.get_mid_price(session, pos.token_id)
             if mid > 0.01:
                 if mid <= pos.entry_price * (1 - STOP_LOSS) or mid <= pos.peak_price * (1 - TRAIL_STOP):
                     await self._execute_and_refresh(session, "SELL", pos.token_id, pos.shares, pos.size_usd, mid)
                     pos.status = "closed"
                     pos.exit_price = mid
-                    logging.info(f"CLOSED {pos.question[:50]} | PnL: ${pos.pnl:+.2f}")
+                    logging.info(f"CLOSED {pos.question[:50]}")
 
-    # ==================== MAIN SCAN ====================
     async def scan_and_copy(self):
         global bot_paused_until, peak_bankroll
 
@@ -266,28 +254,32 @@ class CopyTrader:
 
             logging.info(f"Scanning | bankroll=${bankroll:.4f} | peak=${peak_bankroll:.4f} | open={len(self.positions)}")
 
-            # Update PnL for dashboard
+            # Update PnL every cycle
             await self.update_all_positions_pnl(session)
 
             await self.scan_for_exits(session)
 
             for wallet_addr, config in WALLETS.items():
                 raw = await self.get_positions(session, wallet_addr)
-                if not raw: continue
+                if not raw:
+                    continue
 
                 for p in raw:
                     token_id = p["asset"]
                     side = p["side"]
                     pos_key = f"{wallet_addr}_{token_id}_{side}"
 
-                    if pos_key in self.positions: continue
+                    if pos_key in self.positions:
+                        continue
 
                     best_bid, best_ask = await self.get_orderbook(session, token_id)
                     mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
-                    if mid_price <= 0.01: continue
+                    if mid_price <= 0.01:
+                        continue
 
                     my_size = self._trade_size(bankroll, wallet_addr, mid_price)
-                    if my_size < 0.10: continue
+                    if my_size < 0.10:
+                        continue
 
                     shares = round(my_size / mid_price, 4)
 
@@ -315,36 +307,62 @@ class CopyTrader:
 def run_dashboard():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
             if self.path == "/":
+                self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
                 try:
-                    rows = "".join(
-                        f"<tr><td>{p.source_name}</td><td>{p.question[:50]}</td><td>{p.side}</td>"
-                        f"<td>{p.outcome}</td><td>${p.size_usd:.2f}</td><td>{p.entry_price:.3f}</td>"
-                        f"<td>{p.status}</td><td style='color:{'#4ade80' if p.pnl >=0 else '#f87171'}'>${p.pnl:+.2f}</td></tr>"
-                        for p in bot.positions.values()
-                    )
-                    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>CopyTrader</title>
-                    <meta http-equiv="refresh" content="30">
-                    <style>body{{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #333;padding:8px}}</style>
-                    </head><body>
-                    <h2>Multi-Wallet CopyTrader</h2>
-                    <p>Bankroll: <b>${bot.balance.cached_balance:.4f}</b> | Peak: <b>${peak_bankroll:.4f}</b> | Positions: <b>{len(bot.positions)}</b></p>
-                    <table><tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Status</th><th>PnL</th></tr>
-                    {rows if rows else "<tr><td colspan='8'>No positions yet</td></tr>"}
-                    </table></body></html>"""
+                    rows = ""
+                    for p in bot.positions.values():
+                        color = '#4ade80' if p.pnl >= 0 else '#f87171'
+                        rows += f"""
+                        <tr>
+                            <td>{p.source_name}</td>
+                            <td>{p.question[:60]}</td>
+                            <td>{p.side}</td>
+                            <td>{p.outcome}</td>
+                            <td>${p.size_usd:.2f}</td>
+                            <td>{p.entry_price:.4f}</td>
+                            <td>{p.status}</td>
+                            <td style="color:{color}; font-weight:bold;">${p.pnl:+.2f}</td>
+                        </tr>"""
+
+                    html = f"""<!doctype html>
+                    <html>
+                    <head>
+                        <meta charset="utf-8">
+                        <title>CopyTrader</title>
+                        <meta http-equiv="refresh" content="20">
+                        <style>
+                            body {{ font-family: monospace; padding: 20px; background: #0f0f0f; color: #e0e0e0; }}
+                            table {{ border-collapse: collapse; width: 100%; }}
+                            th, td {{ border: 1px solid #444; padding: 8px 10px; }}
+                            th {{ background: #1a1a1a; }}
+                        </style>
+                    </head>
+                    <body>
+                        <h2>Multi-Wallet CopyTrader</h2>
+                        <p>Bankroll: <b>${bot.balance.cached_balance:.4f}</b> | Peak: <b>${peak_bankroll:.4f}</b> | Open: <b>{len(bot.positions)}</b></p>
+                        <table>
+                            <tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Status</th><th>PnL</th></tr>
+                            {rows if rows else "<tr><td colspan='8' style='text-align:center;padding:30px;'>No positions yet</td></tr>"}
+                        </table>
+                    </body>
+                    </html>"""
                     self.wfile.write(html.encode())
                 except Exception as e:
-                    self.wfile.write(f"Error: {e}".encode())
+                    self.wfile.write(f"Error: {str(e)}".encode())
             else:
+                self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"OK")
 
+        def log_message(self, format, *args):
+            pass
+
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
-    logging.info(f"Dashboard running on port {HEALTH_PORT}")
+    logging.info(f"🌐 Dashboard running on port {HEALTH_PORT}")
     server.serve_forever()
 
 
