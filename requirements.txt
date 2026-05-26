@@ -1,6 +1,5 @@
-web3
-httpx
 asyncio
+httpx
+web3>=6.0.0
 python-dotenv
 aiohttp
-loguru           # optional, nicer logging
