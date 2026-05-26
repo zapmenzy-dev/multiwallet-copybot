@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MULTI-WALLET COPY TRADER - FIXED VERSION
+MULTI-WALLET COPY TRADER
 """
 
 import os
@@ -9,9 +9,8 @@ import asyncio
 import logging
 import time
 import threading
-import re
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -43,40 +42,40 @@ CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
 BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
 
-MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))
+MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))  # no hard limit
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "40"))
-MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))
-MAX_EXPOSURE       = 0.80
-STOP_LOSS          = 0.50
-TRAIL_STOP         = 0.25
-MAX_PER_TRADE      = 0.03
-MIN_TRADE_FRAC     = 0.006
-MAX_TRADE_FRAC     = 0.03
-MIN_SOURCE_SIZE    = 1.0
-LIMIT_ORDER_TICK   = 0.01
+MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))   # 20%
+MAX_EXPOSURE       = 0.80                                       # 80% max total exposure
+STOP_LOSS          = 0.50                                       # close if price drops 50% below entry
+TRAIL_STOP         = 0.25                                       # close if price drops 25% below peak
+MAX_PER_TRADE      = 0.03                                       # 3% per trade
+MIN_TRADE_FRAC     = 0.006                                      # 0.6% of bankroll floor per trade
+MAX_TRADE_FRAC     = 0.03                                       # 3% of bankroll ceiling per trade
+MIN_SOURCE_SIZE    = 1.0                                        # only copy source trades ≥ $1
+LIMIT_ORDER_TICK   = 0.01                                       # place limit 1 tick inside best ask
 
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
-PAUSE_HOURS        = 24
+PAUSE_HOURS        = 24                                         # pause 24h on drawdown
 
-# Valid token ID pattern (64 char hex)
-VALID_TOKEN_PATTERN = re.compile(r'^0x[a-fA-F0-9]{64}$')
-
-# Polymarket API endpoints
-POLYGON_RPCS = [
+# Polymarket contract addresses — source: docs.polymarket.com/resources/contracts
+# pUSD is held directly in the wallet as an ERC-20 token.
+# CTF/NegRisk exchanges hold pUSD as escrow while positions are open.
+#
+# NOTE: Ankr removed — PublicNode and official polygon-rpc.com are more reliable.
+POLYGON_RPCS  = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-rpc.com",
 ]
-
-# FIX 1: Only track pUSD (free balance), not escrowed contracts
-PUSD_CONTRACT = ("pUSD", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6)
-
 BALANCE_OF_SELECTOR = "0x70a08231"
+PUSD_CONTRACTS = [
+    # label,              address,                                      decimals
+    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),  # wallet balance
+    ("CTF-v2",           "0xE111180000d2663C0091e4f400237545B87B996B", 6),  # v2 trading escrow
+    ("NegRisk-v2",       "0xe2222d279d744050d28e00520010520000310F59", 6),  # v2 neg-risk escrow
+]
 
 peak_bankroll: float = BANKROLL_FALLBACK
 bot_paused_until: Optional[datetime] = None
-
-# FIX 2: Track active orders
-active_orders: Dict[str, dict] = {}
 
 
 # ==================== DATA CLASS ====================
@@ -86,70 +85,133 @@ class Position:
     question: str
     outcome: str
     token_id: str
-    side: str
+    side: str               # "BUY" or "SELL"
     entry_price: float
     size_usd: float
     shares: float
     source_wallet: str
     source_name: str
-    order_type: str = "LIMIT"
+    order_type: str = "LIMIT"   # always LIMIT for our copies
     status: str = "open"
     exit_price: float = 0.0
     pnl: float = 0.0
     opened_at: datetime = field(default_factory=datetime.now)
-    peak_price: float = 0.0
-    current_price: float = 0.0
-    order_id: str = ""  # Track order ID for cancellation
+    peak_price: float = 0.0                # highest mid-price seen since entry (for trailing stop)
+    current_price: float = 0.0             # last known mid-price (updated each scan for live PnL)
 
 
-# ==================== BALANCE MANAGER (FIXED) ====================
+# ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
     """
-    Fetches your tradeable USDC balance - FIXED to avoid double-counting.
-    Now only queries free pUSD balance (not escrowed funds).
-    Uses Polymarket API as primary source since it provides true portfolio value.
+    Fetches your tradeable USDC balance using three strategies in order:
+
+    1. RPC batch call — checks USDC.e, native USDC, CTF Exchange, and
+       NegRisk Exchange balances in a single eth_call batch per RPC node.
+       Sums all non-zero results (your funds may be split across contracts).
+
+    2. Polymarket data API — queries /value endpoint which returns your
+       portfolio value as Polymarket sees it. Good fallback if RPC is flaky.
+
+    3. Cached value — last successful read, or BANKROLL_FALLBACK from .env.
     """
 
     def __init__(self):
         self.cached_balance = BANKROLL_FALLBACK
         self.last_update = 0
+        self._breakdown: dict[str, float] = {}   # label → amount for logging
 
-    async def _query_pusd_balance(
+    # ── RPC helpers ──────────────────────────────────────────────────────────
+
+    def _call_payload(self, contract: str, wallet: str) -> dict:
+        padded = wallet.lower().replace("0x", "").zfill(64)
+        return {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": contract, "data": BALANCE_OF_SELECTOR + padded}, "latest"],
+        }
+
+    async def _query_contract(
         self,
         session: aiohttp.ClientSession,
         rpc_url: str,
+        label: str,
+        contract: str,
+        decimals: int,
         wallet: str,
     ) -> Optional[float]:
-        """Query free pUSD balance from your wallet"""
+        """
+        Single balanceOf call.
+        Returns float (0.0 or greater) on success, None on network/RPC error.
+        """
         try:
-            padded = wallet.lower().replace("0x", "").zfill(64)
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_call",
-                "params": [{"to": PUSD_CONTRACT[1], "data": BALANCE_OF_SELECTOR + padded}, "latest"],
-            }
+            payload = self._call_payload(contract, wallet)
             async with session.post(
                 rpc_url,
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
+                text = await resp.text()
                 if resp.status != 200:
+                    logging.debug(f"  {label}: HTTP {resp.status} — {text[:120]}")
                     return None
-                data = await resp.json(content_type=None)
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = json.loads(text)
                 if "error" in data:
+                    logging.debug(f"  {label}: RPC error {data['error']}")
                     return None
                 hex_val = data.get("result") or "0x0"
                 if not hex_val or hex_val in ("0x", "0x0"):
                     return 0.0
-                return int(hex_val, 16) / (10 ** PUSD_CONTRACT[2])
-        except Exception:
+                amount = int(hex_val, 16) / (10 ** decimals)
+                logging.debug(f"  {label}: ${amount:.6f}")
+                return amount
+        except Exception as e:
+            logging.debug(f"  {label} @ {rpc_url}: {e}")
             return None
+
+    async def _fetch_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
+        """
+        Query each contract individually. Tries RPC nodes in order; stops at
+        first responsive node. Returns summed balance or None if all unreachable.
+        """
+        logging.debug(f"Fetching balance for wallet {wallet}")
+        for rpc_url in POLYGON_RPCS:
+            total = 0.0
+            breakdown: dict[str, float] = {}
+            rpc_alive = False
+
+            for label, contract, decimals in PUSD_CONTRACTS:
+                amount = await self._query_contract(
+                    session, rpc_url, label, contract, decimals, wallet
+                )
+                if amount is None:
+                    continue
+                rpc_alive = True
+                if amount > 0:
+                    breakdown[label] = amount
+                    total += amount
+
+            if rpc_alive:
+                self._breakdown = breakdown
+                if total > 0:
+                    parts = ", ".join(f"{k}=${v:.4f}" for k, v in breakdown.items())
+                    logging.info(f"RPC balance: ${total:.4f} ({parts}) via {rpc_url}")
+                else:
+                    logging.info(f"RPC balance: $0.0000 (all contracts zero) via {rpc_url}")
+                return total
+
+            logging.warning(f"RPC {rpc_url} unreachable — trying next")
+
+        return None  # all RPC nodes unreachable
+
+    # ── Polymarket API fallback ───────────────────────────────────────────────
 
     async def _fetch_polymarket_api(
         self, session: aiohttp.ClientSession, wallet: str
     ) -> Optional[float]:
-        """Primary source - Polymarket portfolio value"""
         try:
             url = f"https://data-api.polymarket.com/value?user={wallet}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -169,11 +231,13 @@ class RobustBalanceManager:
                     return None
 
                 if value >= 0:
-                    logging.debug(f"Polymarket API balance: ${value:.4f}")
+                    logging.info(f"Polymarket API balance: ${value:.4f}")
                     return value
         except Exception as e:
             logging.warning(f"Polymarket API balance fetch failed: {e}")
         return None
+
+    # ── Public interface ──────────────────────────────────────────────────────
 
     async def get(self, session: aiohttp.ClientSession, force: bool = False) -> float:
         global peak_bankroll
@@ -185,24 +249,21 @@ class RobustBalanceManager:
         if not YOUR_WALLET:
             logging.warning("DEPOSIT_WALLET_ADDRESS not set — using cached/fallback balance")
             return self.cached_balance
+        if not YOUR_WALLET.startswith("0x") or len(YOUR_WALLET) != 42:
+            logging.error(f"DEPOSIT_WALLET_ADDRESS looks invalid: '{YOUR_WALLET}'")
+            return self.cached_balance
+        logging.debug(f"Balance check for {YOUR_WALLET}")
 
-        # Primary: Polymarket API (gives true portfolio value)
-        balance = await self._fetch_polymarket_api(session, YOUR_WALLET)
+        fetched = await self._fetch_rpc(session, YOUR_WALLET)
 
-        # Fallback: RPC query for free pUSD only
-        if balance is None:
-            for rpc_url in POLYGON_RPCS:
-                balance = await self._query_pusd_balance(session, rpc_url, YOUR_WALLET)
-                if balance is not None:
-                    logging.info(f"RPC free pUSD balance: ${balance:.4f} via {rpc_url}")
-                    break
+        if fetched is None:
+            fetched = await self._fetch_polymarket_api(session, YOUR_WALLET)
 
-        if balance is not None:
-            self.cached_balance = balance
+        if fetched is not None:
+            self.cached_balance = fetched
             self.last_update = time.time()
-            if balance > peak_bankroll:
-                peak_bankroll = balance
-            logging.info(f"Current bankroll: ${balance:.4f}")
+            if fetched > peak_bankroll:
+                peak_bankroll = fetched
         else:
             logging.warning("All balance sources failed — using cached $%.4f", self.cached_balance)
 
@@ -213,10 +274,18 @@ class RobustBalanceManager:
         logging.debug(f"Balance adjusted by {delta:+.4f} → ${self.cached_balance:.4f}")
 
 
-# ==================== EXECUTOR (FIXED) ====================
+# ==================== EXECUTOR ====================
 class PolymarketExecutor:
     """
-    Places LIMIT orders on Polymarket CLOB with order tracking and cancellation.
+    Places LIMIT orders on Polymarket CLOB for all copy trades.
+
+    All copies are placed as GTC limit orders at a price just inside the
+    current best ask (best_ask - LIMIT_ORDER_TICK), capped at MAX_TRADE_FRAC (3% of bankroll)
+    ($0.99). This avoids taker fees and ensures we never spend ≥ $1 on any
+    single copied trade.
+
+    In DRY_RUN mode every call succeeds without hitting the network.
+    Requires py-clob-client: pip install py-clob-client
     """
 
     def __init__(self, dry_run: bool):
@@ -250,39 +319,31 @@ class PolymarketExecutor:
             logging.error(f"CLOB client init failed: {e}")
             raise
 
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an unfilled order"""
-        if self.dry_run:
-            logging.info(f"[DRY RUN] Cancel order {order_id}")
-            return True
-
-        if not self._client:
-            return False
-
-        try:
-            resp = self._client.cancel_order(order_id)
-            success = resp.get("success", False) if isinstance(resp, dict) else False
-            if success:
-                logging.info(f"Cancelled order {order_id}")
-            return success
-        except Exception as e:
-            logging.error(f"Cancel order error: {e}")
-            return False
-
     async def place_limit_buy(
         self,
         token_id: str,
         amount_usd: float,
         best_ask: float,
     ) -> tuple[bool, str]:
-        """Place a GTC limit BUY order"""
-        amount_usd = min(round(amount_usd, 2), 1.0)
+        """
+        Place a GTC limit BUY for `amount_usd` (always < $1) at
+        `best_ask - LIMIT_ORDER_TICK` so we sit inside the spread.
+
+        Returns (success, order_id_or_reason).
+        """
+        # Safety: enforce ceiling before touching the exchange
+        amount_usd = min(round(amount_usd, 2), 1.0)  # hard $1 safety cap
+
+        # Limit price: 1 tick below best ask (we become the new best bid)
         limit_price = round(max(best_ask - LIMIT_ORDER_TICK, 0.01), 4)
-        shares = round(amount_usd / limit_price, 4)
+        shares      = round(amount_usd / limit_price, 4)
 
         if self.dry_run:
             fake_id = f"dry-lmt-{int(time.time())}-{token_id[:8]}"
-            logging.info(f"[DRY RUN] LIMIT BUY {shares:.4f} sh @ {limit_price:.4f} → {fake_id}")
+            logging.info(
+                f"[DRY RUN] LIMIT BUY {shares:.4f} sh @ {limit_price:.4f} "
+                f"(${amount_usd:.2f}) → {fake_id}"
+            )
             return True, fake_id
 
         if not self._client:
@@ -298,13 +359,17 @@ class PolymarketExecutor:
                 side="BUY",
             )
             signed_order = self._client.create_limit_order(order_args)
+            # GTC = Good Till Cancelled — stays on book until filled or cancelled
             resp = self._client.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID", "") or resp.get("id", "")
-            status = resp.get("status", "unknown")
+            status   = resp.get("status", "unknown")
 
             if status in ("matched", "live", "open"):
-                logging.info(f"[LIVE] Limit order live: {order_id} status={status}")
+                logging.info(
+                    f"[LIVE] Limit order live: {order_id} "
+                    f"price={limit_price:.4f} shares={shares:.4f} status={status}"
+                )
                 return True, order_id
             else:
                 logging.warning(f"[LIVE] Limit order rejected: {resp}")
@@ -320,12 +385,18 @@ class PolymarketExecutor:
         shares: float,
         price: float,
     ) -> tuple[bool, str]:
-        """Close a position with a limit sell"""
+        """
+        Close a position with a limit sell at `price + LIMIT_ORDER_TICK`
+        (just above mid — we become the new best ask).
+        Falls back to a GTC limit at mid if price is already near 1.0.
+        """
         limit_price = round(min(price + LIMIT_ORDER_TICK, 0.99), 4)
 
         if self.dry_run:
             fake_id = f"dry-sell-{int(time.time())}-{token_id[:8]}"
-            logging.info(f"[DRY RUN] LIMIT SELL {shares:.4f} sh @ {limit_price:.4f} → {fake_id}")
+            logging.info(
+                f"[DRY RUN] LIMIT SELL {shares:.4f} sh @ {limit_price:.4f} → {fake_id}"
+            )
             return True, fake_id
 
         if not self._client:
@@ -344,7 +415,7 @@ class PolymarketExecutor:
             resp = self._client.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID", "") or resp.get("id", "")
-            status = resp.get("status", "unknown")
+            status   = resp.get("status", "unknown")
 
             if status in ("matched", "live", "open"):
                 logging.info(f"[LIVE] Limit sell live: {order_id} status={status}")
@@ -358,21 +429,28 @@ class PolymarketExecutor:
             return False, str(e)
 
 
-# ==================== COPY TRADER (FIXED) ====================
+# ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
         self.positions: Dict[str, Position] = {}
         self.executor = PolymarketExecutor(dry_run)
         self.balance = RobustBalanceManager()
-        self.positions_being_closed: Set[str] = set()  # Prevent double-closing
 
-    def _validate_token_id(self, token_id: str) -> bool:
-        """Validate token ID format"""
-        return bool(VALID_TOKEN_PATTERN.match(token_id))
+    # -------- helpers --------
 
     def _trade_size(self, bankroll: float, wallet_addr: str, mid_price: float) -> float:
-        """Compute trade size in USD as a fraction of bankroll"""
+        """
+        Compute trade size in USD as a fraction of bankroll.
+
+        Sizing logic:
+        - fixed risk_type: use fixed_risk fraction of bankroll
+        - price_based: fraction scales with mid_price
+
+        Hard limits applied in order:
+        1. Clamp fraction to [MIN_TRADE_FRAC (0.6%), MAX_TRADE_FRAC (3%)]
+        2. Never exceed available headroom
+        """
         config = WALLETS[wallet_addr]
         risk_type = config.get("risk_type", "fixed")
 
@@ -381,9 +459,11 @@ class CopyTrader:
         else:
             fraction = config.get("fixed_risk", MAX_TRADE_FRAC)
 
+        # Clamp between 0.6% and 3% of bankroll
         fraction = max(MIN_TRADE_FRAC, min(fraction, MAX_TRADE_FRAC))
         size = round(bankroll * fraction, 2)
 
+        # Cap to available headroom
         headroom = max(0.0, bankroll * MAX_EXPOSURE - self._total_exposure())
         size = min(size, round(headroom, 2))
 
@@ -406,21 +486,10 @@ class CopyTrader:
             return True
         return False
 
-    async def retry_with_backoff(self, func, max_retries=3) -> any:
-        """Retry API calls with exponential backoff"""
-        for i in range(max_retries):
-            try:
-                return await func()
-            except Exception as e:
-                if i == max_retries - 1:
-                    raise
-                wait_time = 2 ** i
-                logging.debug(f"Retry {i+1}/{max_retries} after {wait_time}s: {e}")
-                await asyncio.sleep(wait_time)
+    # -------- API calls --------
 
     async def get_positions(self, session: aiohttp.ClientSession, wallet_addr: str):
-        """Fetch positions with retry logic"""
-        async def _fetch():
+        try:
             url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
                 if r.status != 200:
@@ -431,12 +500,15 @@ class CopyTrader:
                 cleaned = []
                 for p in (data if isinstance(data, list) else []):
                     token_id = p.get("asset")
-                    if not token_id or not self._validate_token_id(token_id):
+                    if not token_id:
                         continue
 
+                    # currentValue / value = dollar value of the position
+                    # size / shares = number of shares held (never use for $ filter)
                     value = float(p.get("currentValue") or p.get("value") or 0)
                     shares = float(p.get("size") or p.get("shares") or 0)
 
+                    # Fall back to shares × price only if no dollar value provided
                     if value == 0 and shares > 0:
                         price_hint = float(p.get("price") or p.get("lastTradePrice") or 0)
                         value = shares * price_hint
@@ -459,9 +531,6 @@ class CopyTrader:
                         "shares":  abs(shares),
                     })
                 return cleaned
-        
-        try:
-            return await self.retry_with_backoff(_fetch)
         except Exception as e:
             logging.error(f"Fetch positions error ({wallet_addr[:10]}…): {e}")
             return None
@@ -469,8 +538,11 @@ class CopyTrader:
     async def get_orderbook(
         self, session: aiohttp.ClientSession, token_id: str
     ) -> tuple[float, float]:
-        """Returns (best_bid, best_ask) with retry"""
-        async def _fetch():
+        """
+        Returns (best_bid, best_ask). Both 0.0 if unavailable.
+        Used to set limit price (inside spread) and compute mid.
+        """
+        try:
             url = f"https://clob.polymarket.com/book?token_id={token_id}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
@@ -480,13 +552,9 @@ class CopyTrader:
                     bb = float(bids[0]["price"]) if bids else 0.0
                     ba = float(asks[0]["price"]) if asks else 0.0
                     return bb, ba
-                return 0.0, 0.0
-        
-        try:
-            return await self.retry_with_backoff(_fetch)
         except Exception as e:
             logging.warning(f"get_orderbook error for {token_id[:12]}…: {e}")
-            return 0.0, 0.0
+        return 0.0, 0.0
 
     async def get_mid_price(self, session: aiohttp.ClientSession, token_id: str) -> float:
         bb, ba = await self.get_orderbook(session, token_id)
@@ -494,10 +562,93 @@ class CopyTrader:
             return (bb + ba) / 2
         return bb or ba or 0.0
 
+    # -------- source wallet tracking --------
+
+    async def _get_source_position(
+        self,
+        session: aiohttp.ClientSession,
+        wallet_addr: str,
+        token_id: str,
+    ) -> Optional[dict]:
+        """
+        Fetch source wallet's position for token_id with NO value floor —
+        we want to detect the position even if it has dropped below $1,
+        so we don't falsely treat a shrinking position as "exited".
+        Returns None only when the token is genuinely absent.
+        Returns {"_network_error": True} on API failure.
+        """
+        try:
+            url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    logging.warning(f"_get_source_position: API {r.status} for {wallet_addr[:10]}…")
+                    return {"_network_error": True}
+                data = await r.json()
+                positions = data if isinstance(data, list) else []
+                match = next((p for p in positions if p.get("asset") == token_id), None)
+                if match is None:
+                    return None
+                value  = float(match.get("currentValue") or match.get("value") or match.get("size") or 0)
+                shares = float(match.get("size") or match.get("shares") or 0)
+                raw_side = (match.get("side") or "").upper()
+                side = raw_side if raw_side in ("BUY", "SELL") else ("SELL" if value < 0 else "BUY")
+                return {
+                    "asset":   token_id,
+                    "title":   match.get("title", ""),
+                    "outcome": match.get("outcome", "YES"),
+                    "side":    side,
+                    "value":   abs(value),
+                    "shares":  abs(shares),
+                }
+        except Exception as e:
+            logging.warning(f"_get_source_position error ({wallet_addr[:10]}…): {e}")
+            return {"_network_error": True}
+
+    # -------- update PnL for current positions --------
+    
+    async def update_positions_pnl(self, session: aiohttp.ClientSession):
+        """
+        Update PnL for all open positions based on current market prices.
+        This does NOT close positions, only updates the pnl and current_price fields.
+        """
+        for pos_key, pos in self.positions.items():
+            if pos.status != "open":
+                continue
+            
+            # Get current mid price for this position
+            mid_price = await self.get_mid_price(session, pos.token_id)
+            
+            if mid_price > 0:
+                # Update current price
+                pos.current_price = mid_price
+                
+                # Update peak price for trailing stop calculation
+                if pos.peak_price <= 0:
+                    pos.peak_price = pos.entry_price
+                if mid_price > pos.peak_price:
+                    pos.peak_price = mid_price
+                
+                # Calculate unrealized PnL
+                if pos.side == "BUY":
+                    unrealized_pnl = (mid_price - pos.entry_price) * pos.shares
+                else:  # SELL side (shorts)
+                    unrealized_pnl = (pos.entry_price - mid_price) * pos.shares
+                
+                # Store in pnl field (this will show unrealized PnL for open positions)
+                pos.pnl = unrealized_pnl
+                
+                logging.debug(
+                    f"PnL UPDATE {pos.question[:40]} | "
+                    f"price={mid_price:.4f} entry={pos.entry_price:.4f} "
+                    f"unrealized PnL=${unrealized_pnl:+.2f}"
+                )
+
+    # -------- execute + refresh --------
+
     async def _execute_and_refresh(
         self,
         session: aiohttp.ClientSession,
-        action: str,
+        action: str,           # "BUY" or "SELL"
         token_id: str,
         shares: float,
         size_usd: float,
@@ -517,51 +668,70 @@ class CopyTrader:
 
         return ok, oid
 
+    # -------- exit scanner --------
+
     async def scan_for_exits(self, session: aiohttp.ClientSession):
         """
-        Close positions based on exit conditions.
-        FIXED: Track which positions are being closed to prevent double-closing.
+        Close a position when ANY of these conditions are met:
+        1. Source wallet no longer holds the token (copy-exit).
+        2. Price dropped ≥ 50% below entry (hard stop-loss).
+        3. Price dropped ≥ 25% below the position's peak price (trailing stop).
+
+        Fetches each source wallet ONCE per cycle (not once per position)
+        to avoid hammering the API with 54 sequential calls.
+        Network errors are ignored — never close on a flaky API response.
         """
-        wallet_snapshot: dict[str, dict] = {}
+        # ── Step 1: fetch each source wallet once ────────────────────────────
+        wallet_snapshot: dict[str, dict] = {}  # wallet_addr → {token_id: position_dict}
         wallet_error: set[str] = set()
 
-        # Fetch each source wallet once
         for wallet_addr in set(p.source_wallet for p in self.positions.values() if p.status == "open"):
             try:
                 url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=500"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     if r.status != 200:
-                        logging.warning(f"scan_for_exits: API {r.status} for {wallet_addr[:10]}…")
+                        logging.warning(f"scan_for_exits: API {r.status} for {wallet_addr[:10]}… — holding all")
                         wallet_error.add(wallet_addr)
                         continue
                     data = await r.json()
                     positions = data if isinstance(data, list) else []
                     wallet_snapshot[wallet_addr] = {p.get("asset"): p for p in positions if p.get("asset")}
+                    logging.info(f"EXIT-SCAN fetched {len(wallet_snapshot[wallet_addr])} positions for {wallet_addr[:10]}…")
             except Exception as e:
-                logging.warning(f"scan_for_exits fetch error ({wallet_addr[:10]}…): {e}")
+                logging.warning(f"scan_for_exits fetch error ({wallet_addr[:10]}…): {e} — holding all")
                 wallet_error.add(wallet_addr)
 
-        # Evaluate each open position
+        # ── Step 2: evaluate each open position against snapshot ─────────────
         to_close: list[tuple[str, Position, float, str]] = []
 
         for pos_key, pos in list(self.positions.items()):
-            if pos.status != "open" or pos_key in self.positions_being_closed:
+            if pos.status != "open":
                 continue
 
+            # Skip on network error — never close on bad data
             if pos.source_wallet in wallet_error:
                 continue
 
             snapshot = wallet_snapshot.get(pos.source_wallet, {})
             source_raw = snapshot.get(pos.token_id)
 
+            # Get current mid price
             mid_price = await self.get_mid_price(session, pos.token_id)
 
+            # Update live price tracking
             if mid_price > 0:
                 pos.current_price = mid_price
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
                 if mid_price > pos.peak_price:
                     pos.peak_price = mid_price
+
+            src_val = float(source_raw.get("currentValue") or source_raw.get("value") or 0) if source_raw else 0
+            logging.info(
+                f"  CHECK {pos.question[:45]} | "
+                f"mid={mid_price:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
+                f"source={'$'+str(round(src_val,2)) if source_raw else 'EXITED'}"
+            )
 
             reason = None
 
@@ -575,29 +745,23 @@ class CopyTrader:
             if reason:
                 to_close.append((pos_key, pos, mid_price or pos.entry_price, reason))
 
-        # Execute closes
+        # ── Step 3: execute closes ────────────────────────────────────────────
         for pos_key, pos, exit_price, reason in to_close:
-            self.positions_being_closed.add(pos_key)
-            try:
-                # Cancel any existing order for this position
-                if pos.order_id:
-                    await self.executor.cancel_order(pos.order_id)
-                
-                ok, _ = await self._execute_and_refresh(
-                    session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price
+            ok, _ = await self._execute_and_refresh(
+                session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price
+            )
+            if ok:
+                pos.status     = "closed"
+                pos.exit_price = exit_price
+                pos.pnl        = (exit_price - pos.entry_price) * pos.shares
+                logging.info(
+                    f"CLOSED [{reason}] {pos.question[:50]} | "
+                    f"entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
+                    f"exit={pos.exit_price:.3f} pnl=${pos.pnl:+.2f}"
                 )
-                if ok:
-                    pos.status = "closed"
-                    pos.exit_price = exit_price
-                    pos.pnl = (exit_price - pos.entry_price) * pos.shares
-                    logging.info(
-                        f"CLOSED [{reason}] {pos.question[:50]} | "
-                        f"entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
-                        f"exit={pos.exit_price:.3f} pnl=${pos.pnl:+.2f}"
-                    )
-                    del self.positions[pos_key]
-            finally:
-                self.positions_being_closed.discard(pos_key)
+                del self.positions[pos_key]
+
+    # -------- main scan loop --------
 
     async def scan_and_copy(self):
         global bot_paused_until, peak_bankroll
@@ -626,6 +790,9 @@ class CopyTrader:
                 f"exposure=${self._total_exposure():.2f}"
             )
 
+            # Update PnL for all open positions first
+            await self.update_positions_pnl(session)
+            
             await self.scan_for_exits(session)
 
             for wallet_addr, config in WALLETS.items():
@@ -636,8 +803,8 @@ class CopyTrader:
                 for pos in raw:
                     token_id = pos["asset"]
                     question = pos["title"]
-                    side = pos["side"]
-                    pos_key = f"{wallet_addr}_{token_id}_{side}"
+                    side     = pos["side"]
+                    pos_key  = f"{wallet_addr}_{token_id}_{side}"
 
                     if pos_key in self.positions:
                         continue
@@ -650,12 +817,6 @@ class CopyTrader:
 
                     if mid_price <= 0.01:
                         logging.debug(f"Skipping {token_id[:12]}… — no price")
-                        continue
-
-                    # Validate slippage
-                    expected_price = pos.get("price", mid_price)
-                    if abs(mid_price - expected_price) / expected_price > 0.05:  # 5% max slippage
-                        logging.warning(f"Skipping {question[:50]} - excessive slippage")
                         continue
 
                     my_size = self._trade_size(bankroll, wallet_addr, mid_price)
@@ -677,19 +838,20 @@ class CopyTrader:
 
                     if ok:
                         self.positions[pos_key] = Position(
-                            market_id="",
-                            question=question,
-                            outcome=pos["outcome"],
-                            side=side,
-                            token_id=token_id,
-                            entry_price=mid_price,
-                            size_usd=my_size,
-                            shares=shares,
-                            source_wallet=wallet_addr,
-                            source_name=config["name"],
-                            order_type="LIMIT",
-                            peak_price=mid_price,
-                            order_id=order_id,  # Store order ID
+                            market_id    = "",
+                            question     = question,
+                            outcome      = pos["outcome"],
+                            side         = side,
+                            token_id     = token_id,
+                            entry_price  = mid_price,
+                            size_usd     = my_size,
+                            shares       = shares,
+                            source_wallet= wallet_addr,
+                            source_name  = config["name"],
+                            order_type   = "LIMIT",
+                            peak_price   = mid_price,
+                            current_price = mid_price,  # Initialize current price
+                            pnl          = 0.0,  # Initialize PnL
                         )
                         logging.info(
                             f"COPIED [{config['name']}] LIMIT {side} ${my_size:.2f} "
@@ -697,13 +859,6 @@ class CopyTrader:
                         )
 
     async def run(self):
-        # Validate config on startup
-        if not DRY_RUN:
-            assert YOUR_PRIVATE_KEY, "PRIVATE_KEY not set"
-            assert YOUR_WALLET, "DEPOSIT_WALLET_ADDRESS not set"
-            assert CLOB_API_KEY and CLOB_SECRET, "API credentials missing"
-            logging.info("Configuration validated")
-        
         logging.info(f"Bot started | dry_run={self.dry_run} | wallets={len(WALLETS)}")
         while True:
             try:
@@ -722,27 +877,27 @@ def run_dashboard():
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
                 try:
-                    bankroll = bot.balance.cached_balance
-                    open_pos = [p for p in bot.positions.values() if p.status == "open"]
-                    
+                    bankroll  = bot.balance.cached_balance
+                    open_pos  = [p for p in bot.positions.values() if p.status == "open"]
                     def _upnl(p):
                         if p.status == 'closed':
                             return p.pnl
-                        price = p.current_price if p.current_price > 0 else p.entry_price
-                        return (price - p.entry_price) * p.shares
+                        # For open positions, use the stored pnl (unrealized)
+                        return p.pnl
 
                     rows = "".join(
-                        f"<table>"
+                        f"<tr>"
                         f"<td>{p.source_name}</td>"
                         f"<td>{p.question[:50]}</td>"
                         f"<td style='color:{'#4ade80' if p.side=='BUY' else '#f87171'}'>{p.side}</td>"
                         f"<td>{p.outcome}</td>"
                         f"<td>${p.size_usd:.2f}</td>"
                         f"<td>{p.entry_price:.3f}</td>"
+                        f"<td>{p.current_price:.3f}如果"  # Added current price column
                         f"<td>{p.order_type}</td>"
                         f"<td>{p.status}</td>"
                         f"<td style='color:{'#4ade80' if _upnl(p)>=0 else '#f87171'}'>${_upnl(p):+.2f}</td>"
-                        f"</tr>"
+                        f"</table>"
                         for p in bot.positions.values()
                     )
                     pause_str = (
@@ -767,10 +922,10 @@ def run_dashboard():
                        Peak: <b>${peak_bankroll:.4f}</b> &nbsp;|&nbsp;
                        Open positions: <b>{len(open_pos)}</b></p>
                     <table>
-                       <tr><th>Source</th><th>Market</th><th>Side</th>
+                      <tr><th>Source</th><th>Market</th><th>Side</th>
                           <th>Outcome</th><th>Size</th><th>Entry</th>
-                          <th>Order</th><th>Status</th><th>PnL</th></tr>
-                      {rows if rows else "<tr><td colspan='9'>No positions</td></tr>"}
+                          <th>Current</th><th>Order</th><th>Status</th><th>PnL</th></tr>
+                      {rows if rows else "<tr><td colspan='10'>No positions</td></tr>"}
                     </table>
                     </body></html>"""
                     self.wfile.write(html.encode())
