@@ -45,7 +45,7 @@ BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
 MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "8"))
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "40"))
 MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))   # 20%
-MAX_EXPOSURE       = 0.90                                       # 90% max total exposure
+MAX_EXPOSURE       = 0.80                                       # 80% max total exposure
 STOP_LOSS          = 0.50                                       # close if price drops 50% below entry
 TRAIL_STOP         = 0.25                                       # close if price drops 25% below peak
 MAX_PER_TRADE      = 0.03                                       # 3% per trade
@@ -564,10 +564,39 @@ class CopyTrader:
         wallet_addr: str,
         token_id: str,
     ) -> Optional[dict]:
-        positions = await self.get_positions(session, wallet_addr)
-        if positions is None:
+        """
+        Fetch source wallet's position for token_id with NO value floor —
+        we want to detect the position even if it has dropped below $1,
+        so we don't falsely treat a shrinking position as "exited".
+        Returns None only when the token is genuinely absent.
+        Returns {"_network_error": True} on API failure.
+        """
+        try:
+            url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status != 200:
+                    logging.warning(f"_get_source_position: API {r.status} for {wallet_addr[:10]}…")
+                    return {"_network_error": True}
+                data = await r.json()
+                positions = data if isinstance(data, list) else []
+                match = next((p for p in positions if p.get("asset") == token_id), None)
+                if match is None:
+                    return None
+                value  = float(match.get("currentValue") or match.get("value") or match.get("size") or 0)
+                shares = float(match.get("size") or match.get("shares") or 0)
+                raw_side = (match.get("side") or "").upper()
+                side = raw_side if raw_side in ("BUY", "SELL") else ("SELL" if value < 0 else "BUY")
+                return {
+                    "asset":   token_id,
+                    "title":   match.get("title", ""),
+                    "outcome": match.get("outcome", "YES"),
+                    "side":    side,
+                    "value":   abs(value),
+                    "shares":  abs(shares),
+                }
+        except Exception as e:
+            logging.warning(f"_get_source_position error ({wallet_addr[:10]}…): {e}")
             return {"_network_error": True}
-        return next((p for p in positions if p["asset"] == token_id), None)
 
     # -------- execute + refresh --------
 
@@ -614,7 +643,17 @@ class CopyTrader:
             source_pos = await self._get_source_position(session, pos.source_wallet, pos.token_id)
 
             if source_pos and source_pos.get("_network_error"):
+                logging.debug(f"  EXIT-SCAN {pos.question[:40]} — network error, holding")
                 continue  # API flaky — hold position
+
+            src_val = source_pos.get("value", 0) if source_pos else 0
+            logging.debug(
+                f"  EXIT-SCAN {pos.question[:40]} | "
+                f"mid={mid_price:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
+                f"sl={pos.entry_price*(1-STOP_LOSS):.3f} "
+                f"trail={pos.peak_price*(1-TRAIL_STOP):.3f} "
+                f"source={'held $'+str(round(src_val,2)) if source_pos else 'EXITED'}"
+            )
 
             reason = None
 
