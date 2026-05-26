@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MULTI-WALLET COPY TRADER with WebSocket Price Feed
+MULTI-WALLET COPY TRADER with Real-Time WebSocket Price Updates
 """
 
 import os
@@ -10,9 +10,10 @@ import logging
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, List
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import deque
 
 import aiohttp
 from dotenv import load_dotenv
@@ -53,6 +54,7 @@ MIN_TRADE_FRAC     = 0.006
 MAX_TRADE_FRAC     = 0.03
 MIN_SOURCE_SIZE    = 1.0
 LIMIT_ORDER_TICK   = 0.01
+DAILY_LOSS_LIMIT   = float(os.getenv("DAILY_LOSS_LIMIT", "100"))
 
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24
@@ -70,28 +72,53 @@ PUSD_CONTRACTS = [
 
 peak_bankroll: float = BANKROLL_FALLBACK
 bot_paused_until: Optional[datetime] = None
+daily_loss_today: float = 0.0
+last_loss_reset_date: str = ""
 
-# ==================== WEBSOCKET PRICE MANAGER ====================
-class WebSocketPriceManager:
+
+def halt_bot():
+    """Emergency halt the bot when daily loss limit is hit."""
+    global bot_paused_until
+    bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
+    logging.error(f"🚨 DAILY LOSS LIMIT HIT (${DAILY_LOSS_LIMIT}) - Bot paused until {bot_paused_until}")
+
+
+# ==================== REAL-TIME WEBSOCKET PRICE MANAGER ====================
+class RealTimeWebSocketManager:
     """
-    Manages WebSocket connection to Polymarket for real-time price updates.
-    Subscribes to all token_ids that have open positions and updates them live.
+    Real-time WebSocket manager for Polymarket order book updates.
+    Provides millisecond-latency price updates for accurate PnL calculation.
     """
     
     def __init__(self):
-        self.price_cache: Dict[str, float] = {}  # token_id -> mid_price
+        self.bid_cache: Dict[str, float] = {}      # token_id -> best_bid
+        self.ask_cache: Dict[str, float] = {}      # token_id -> best_ask
+        self.mid_cache: Dict[str, float] = {}      # token_id -> mid_price
+        self.full_orderbook: Dict[str, dict] = {}   # token_id -> {bids: [], asks: []}
         self._subscribed_tokens: Set[str] = set()
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._price_callbacks: Dict[str, List[callable]] = {}  # token_id -> list of callbacks
         
+    def register_callback(self, token_id: str, callback: callable):
+        """Register a callback to be called when price updates for a token"""
+        if token_id not in self._price_callbacks:
+            self._price_callbacks[token_id] = []
+        self._price_callbacks[token_id].append(callback)
+        
+    def unregister_callback(self, token_id: str, callback: callable):
+        """Unregister a callback"""
+        if token_id in self._price_callbacks and callback in self._price_callbacks[token_id]:
+            self._price_callbacks[token_id].remove(callback)
+            
     async def start(self, session: aiohttp.ClientSession):
         """Start the WebSocket connection"""
         self._session = session
         self._running = True
         self._task = asyncio.create_task(self._websocket_loop())
-        logging.info("WebSocket price manager started")
+        logging.info("Real-time WebSocket price manager started")
         
     async def stop(self):
         """Stop the WebSocket connection"""
@@ -104,30 +131,29 @@ class WebSocketPriceManager:
                 pass
         if self._ws:
             await self._ws.close()
-        logging.info("WebSocket price manager stopped")
+        logging.info("Real-time WebSocket price manager stopped")
         
     async def subscribe(self, token_id: str):
-        """Subscribe to price updates for a token_id"""
+        """Subscribe to real-time order book updates for a token_id"""
         if token_id in self._subscribed_tokens:
             return
             
         self._subscribed_tokens.add(token_id)
         
-        # If already connected, send subscription message
         if self._ws and not self._ws.closed:
             try:
                 sub_msg = json.dumps({
                     "type": "subscribe",
-                    "channel": "price",
+                    "channel": "level2",
                     "token_id": token_id
                 })
                 await self._ws.send_str(sub_msg)
-                logging.debug(f"Subscribed to WebSocket price feed for {token_id[:12]}...")
+                logging.info(f"📡 Subscribed to real-time order book for {token_id[:12]}...")
             except Exception as e:
                 logging.warning(f"Failed to subscribe to {token_id[:12]}: {e}")
                 
     async def unsubscribe(self, token_id: str):
-        """Unsubscribe from price updates"""
+        """Unsubscribe from order book updates"""
         if token_id not in self._subscribed_tokens:
             return
             
@@ -137,16 +163,32 @@ class WebSocketPriceManager:
             try:
                 unsub_msg = json.dumps({
                     "type": "unsubscribe",
-                    "channel": "price",
+                    "channel": "level2",
                     "token_id": token_id
                 })
                 await self._ws.send_str(unsub_msg)
+                logging.info(f"📡 Unsubscribed from order book for {token_id[:12]}...")
             except Exception:
                 pass
                 
-    def get_price(self, token_id: str) -> float:
-        """Get the latest cached price for a token_id"""
-        return self.price_cache.get(token_id, 0.0)
+    def get_best_bid(self, token_id: str) -> float:
+        """Get the latest cached best bid (real-time)"""
+        return self.bid_cache.get(token_id, 0.0)
+    
+    def get_best_ask(self, token_id: str) -> float:
+        """Get the latest cached best ask (real-time)"""
+        return self.ask_cache.get(token_id, 0.0)
+    
+    def get_mid_price(self, token_id: str) -> float:
+        """Get the latest cached mid price (real-time)"""
+        return self.mid_cache.get(token_id, 0.0)
+    
+    def get_orderbook_depth(self, token_id: str, depth: int = 10) -> tuple:
+        """Get order book depth for more accurate PnL calculation"""
+        book = self.full_orderbook.get(token_id, {})
+        bids = book.get("bids", [])[:depth]
+        asks = book.get("asks", [])[:depth]
+        return bids, asks
         
     async def _websocket_loop(self):
         """Main WebSocket connection loop with auto-reconnect"""
@@ -162,13 +204,13 @@ class WebSocketPriceManager:
         """Establish WebSocket connection"""
         ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws"
         self._ws = await self._session.ws_connect(ws_url)
-        logging.info("WebSocket connected to Polymarket")
+        logging.info("🔌 Real-time WebSocket connected to Polymarket")
         
         # Resubscribe to all tokens
         for token_id in self._subscribed_tokens:
             sub_msg = json.dumps({
                 "type": "subscribe",
-                "channel": "price",
+                "channel": "level2",
                 "token_id": token_id
             })
             await self._ws.send_str(sub_msg)
@@ -188,34 +230,103 @@ class WebSocketPriceManager:
                 break
                 
     async def _handle_message(self, data: dict):
-        """Handle incoming price update messages"""
-        msg_type = data.get("type")
+        """Handle incoming order book update messages"""
+        event_type = data.get("event_type")
         
-        if msg_type == "price":
-            # Price update message
-            token_id = data.get("token_id")
-            mid_price = data.get("mid_price") or data.get("price")
-            
-            if token_id and mid_price:
-                self.price_cache[token_id] = float(mid_price)
-                logging.debug(f"WebSocket price update: {token_id[:12]}... = ${mid_price:.4f}")
-                
-        elif msg_type == "book":
-            # Order book snapshot
-            token_id = data.get("token_id")
+        if event_type == "book":
+            # Full order book snapshot
+            token_id = data.get("asset_id")
             bids = data.get("bids", [])
             asks = data.get("asks", [])
             
-            if token_id and bids and asks:
-                best_bid = float(bids[0].get("price", 0)) if bids else 0
-                best_ask = float(asks[0].get("price", 0)) if asks else 0
-                if best_bid and best_ask:
-                    mid_price = (best_bid + best_ask) / 2
-                    self.price_cache[token_id] = mid_price
-                    logging.debug(f"WebSocket book update: {token_id[:12]}... = ${mid_price:.4f}")
+            if token_id:
+                self.full_orderbook[token_id] = {"bids": bids, "asks": asks}
+                
+                if bids:
+                    self.bid_cache[token_id] = float(bids[0].get("price", 0))
+                if asks:
+                    self.ask_cache[token_id] = float(asks[0].get("price", 0))
+                if bids and asks:
+                    self.mid_cache[token_id] = (self.bid_cache[token_id] + self.ask_cache[token_id]) / 2
+                elif bids:
+                    self.mid_cache[token_id] = self.bid_cache[token_id]
+                elif asks:
+                    self.mid_cache[token_id] = self.ask_cache[token_id]
+                    
+                # Trigger callbacks for real-time PnL updates
+                if token_id in self._price_callbacks:
+                    for callback in self._price_callbacks[token_id]:
+                        try:
+                            await callback(token_id, self.get_best_bid(token_id), self.get_best_ask(token_id))
+                        except Exception as e:
+                            logging.error(f"Callback error for {token_id[:12]}: {e}")
+                            
+                logging.debug(f"📚 Order book update: {token_id[:12]}... bid={self.bid_cache.get(token_id,0):.4f} ask={self.ask_cache.get(token_id,0):.4f}")
+                
+        elif event_type == "update":
+            # Incremental order book update
+            token_id = data.get("asset_id")
+            updates = data.get("updates", [])
+            
+            if token_id and token_id in self.full_orderbook:
+                for update in updates:
+                    side = update.get("side")
+                    price = float(update.get("price", 0))
+                    size = float(update.get("size", 0))
+                    
+                    if side == "buy":
+                        # Update bids
+                        bids = self.full_orderbook[token_id].get("bids", [])
+                        # Find and update or insert
+                        updated = False
+                        for i, bid in enumerate(bids):
+                            if float(bid.get("price", 0)) == price:
+                                if size == 0:
+                                    bids.pop(i)
+                                else:
+                                    bids[i] = {"price": price, "size": size}
+                                updated = True
+                                break
+                        if not updated and size > 0:
+                            bids.append({"price": price, "size": size})
+                            bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                        self.full_orderbook[token_id]["bids"] = bids
+                        
+                    elif side == "sell":
+                        # Update asks
+                        asks = self.full_orderbook[token_id].get("asks", [])
+                        updated = False
+                        for i, ask in enumerate(asks):
+                            if float(ask.get("price", 0)) == price:
+                                if size == 0:
+                                    asks.pop(i)
+                                else:
+                                    asks[i] = {"price": price, "size": size}
+                                updated = True
+                                break
+                        if not updated and size > 0:
+                            asks.append({"price": price, "size": size})
+                            asks.sort(key=lambda x: float(x["price"]))
+                        self.full_orderbook[token_id]["asks"] = asks
+                
+                # Update best bid/ask
+                if self.full_orderbook[token_id].get("bids"):
+                    self.bid_cache[token_id] = float(self.full_orderbook[token_id]["bids"][0]["price"])
+                if self.full_orderbook[token_id].get("asks"):
+                    self.ask_cache[token_id] = float(self.full_orderbook[token_id]["asks"][0]["price"])
+                if self.bid_cache.get(token_id, 0) and self.ask_cache.get(token_id, 0):
+                    self.mid_cache[token_id] = (self.bid_cache[token_id] + self.ask_cache[token_id]) / 2
+                    
+                # Trigger callbacks for real-time PnL
+                if token_id in self._price_callbacks:
+                    for callback in self._price_callbacks[token_id]:
+                        try:
+                            await callback(token_id, self.get_best_bid(token_id), self.get_best_ask(token_id))
+                        except Exception as e:
+                            logging.error(f"Callback error: {e}")
 
 
-# ==================== DATA CLASS ====================
+# ==================== DATA CLASS with WAP Tracking ====================
 @dataclass
 class Position:
     market_id: str
@@ -223,7 +334,7 @@ class Position:
     outcome: str
     token_id: str
     side: str
-    entry_price: float
+    entry_price: float          # Weighted Average Price (WAP)
     size_usd: float
     shares: float
     source_wallet: str
@@ -235,28 +346,113 @@ class Position:
     opened_at: datetime = field(default_factory=datetime.now)
     peak_price: float = 0.0
     current_price: float = 0.0
+    current_best_bid: float = 0.0
+    current_best_ask: float = 0.0
+    
+    # WAP tracking for DCA/ladder strategies
+    total_shares_filled: float = 0.0
+    total_cost_usd: float = 0.0
+    fill_history: List[dict] = field(default_factory=list)  # Track individual fills
+    
+    # Real-time PnL tracking
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    last_update_time: datetime = field(default_factory=datetime.now)
 
-    def pnl_unrealized(self) -> float:
-        if self.status != "open" or self.entry_price <= 0 or self.current_price <= 0:
-            return 0.0
-        tokens = self.size_usd / self.entry_price
-        return tokens * self.current_price - self.size_usd
+    def update_wap(self, new_shares: float, new_price: float):
+        """
+        Update Weighted Average Price (WAP) when new fills occur.
+        This is critical for DCA and ladder strategies.
+        """
+        new_cost = new_shares * new_price
+        self.total_shares_filled += new_shares
+        self.total_cost_usd += new_cost
+        self.shares = self.total_shares_filled
+        self.size_usd = self.total_cost_usd
+        self.entry_price = self.total_cost_usd / self.total_shares_filled if self.total_shares_filled > 0 else 0
+        
+        # Record fill for audit
+        self.fill_history.append({
+            "shares": new_shares,
+            "price": new_price,
+            "cost": new_cost,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        logging.info(f"📊 WAP Updated: {self.question[:35]} | New WAP: ${self.entry_price:.4f} | Total Shares: {self.shares:.4f}")
 
-    def pnl_pct(self) -> float:
-        if self.status != "open" or self.entry_price <= 0:
-            return 0.0
-        return (self.current_price - self.entry_price) / self.entry_price * 100.0
+    def update_realized_pnl(self, exit_shares: float, exit_price: float):
+        """
+        Update realized PnL when partially or fully closing a position.
+        Uses FIFO or average cost method based on WAP.
+        """
+        if exit_shares > self.shares:
+            exit_shares = self.shares
+            
+        cost_basis = exit_shares * self.entry_price
+        proceeds = exit_shares * exit_price
+        realized = proceeds - cost_basis
+        
+        self.realized_pnl += realized
+        self.shares -= exit_shares
+        self.size_usd -= cost_basis
+        self.total_shares_filled -= exit_shares
+        self.total_cost_usd -= cost_basis
+        
+        # Recalculate WAP if still have shares
+        if self.shares > 0:
+            self.entry_price = self.total_cost_usd / self.total_shares_filled
+        
+        logging.info(f"💰 Realized PnL: ${realized:+.2f} | Total Realized: ${self.realized_pnl:+.2f} | Remaining Shares: {self.shares:.4f}")
+        return realized
 
-    def current_value(self) -> float:
-        if self.status != "open" or self.entry_price <= 0 or self.current_price <= 0:
-            return 0.0
-        tokens = self.size_usd / self.entry_price
-        return tokens * self.current_price
+    def calculate_unrealized_pnl(self, current_best_bid: float, current_best_ask: float) -> float:
+        """
+        Calculate current unrealized PnL based on live order book best bid/ask.
+        Uses best bid for LONG positions (what you can sell at now).
+        """
+        if self.status != "open" or self.shares <= 0:
+            return self.unrealized_pnl
+            
+        # For long positions, use best bid (exit price)
+        if self.side == "BUY":
+            exit_price = current_best_bid if current_best_bid > 0 else self.current_price
+        else:
+            # For short positions, use best ask
+            exit_price = current_best_ask if current_best_ask > 0 else self.current_price
+            
+        if exit_price <= 0:
+            return self.unrealized_pnl
+            
+        self.unrealized_pnl = (exit_price - self.entry_price) * self.shares
+        self.current_price = exit_price
+        self.current_best_bid = current_best_bid
+        self.current_best_ask = current_best_ask
+        self.last_update_time = datetime.now()
+        
+        return self.unrealized_pnl
 
     def total_pnl(self) -> float:
+        """Combined realized + unrealized PnL"""
         if self.status == "closed":
             return self.pnl
-        return self.pnl_unrealized()
+        return self.realized_pnl + self.unrealized_pnl
+
+    def pnl_pct(self) -> float:
+        """Return PnL percentage based on current price"""
+        if self.status != "open" or self.entry_price <= 0:
+            return 0.0
+        price = self.current_best_bid if self.current_best_bid > 0 else self.current_price
+        if price <= 0:
+            return 0.0
+        return (price - self.entry_price) / self.entry_price * 100.0
+
+    def current_value(self) -> float:
+        """Current market value based on best bid"""
+        if self.status != "open" or self.shares <= 0:
+            return 0.0
+        price = self.current_best_bid if self.current_best_bid > 0 else self.current_price
+        return self.shares * price
 
 
 # ==================== BALANCE MANAGER ====================
@@ -444,7 +640,7 @@ class PolymarketExecutor:
         token_id: str,
         amount_usd: float,
         best_ask: float,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, float]:
         amount_usd = min(round(amount_usd, 2), 1.0)
         limit_price = round(max(best_ask - LIMIT_ORDER_TICK, 0.01), 4)
         shares = round(amount_usd / limit_price, 4)
@@ -455,10 +651,10 @@ class PolymarketExecutor:
                 f"[DRY RUN] LIMIT BUY {shares:.4f} sh @ {limit_price:.4f} "
                 f"(${amount_usd:.2f}) → {fake_id}"
             )
-            return True, fake_id
+            return True, fake_id, limit_price
 
         if not self._client:
-            return False, "client_not_initialised"
+            return False, "client_not_initialised", 0
 
         try:
             from py_clob_client.clob_types import LimitOrderArgs, OrderType
@@ -480,21 +676,21 @@ class PolymarketExecutor:
                     f"[LIVE] Limit order live: {order_id} "
                     f"price={limit_price:.4f} shares={shares:.4f} status={status}"
                 )
-                return True, order_id
+                return True, order_id, limit_price
             else:
                 logging.warning(f"[LIVE] Limit order rejected: {resp}")
-                return False, status
+                return False, status, 0
 
         except Exception as e:
             logging.error(f"place_limit_buy error: {e}")
-            return False, str(e)
+            return False, str(e), 0
 
     async def place_sell(
         self,
         token_id: str,
         shares: float,
         price: float,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, float]:
         limit_price = round(min(price + LIMIT_ORDER_TICK, 0.99), 4)
 
         if self.dry_run:
@@ -502,10 +698,10 @@ class PolymarketExecutor:
             logging.info(
                 f"[DRY RUN] LIMIT SELL {shares:.4f} sh @ {limit_price:.4f} → {fake_id}"
             )
-            return True, fake_id
+            return True, fake_id, limit_price
 
         if not self._client:
-            return False, "client_not_initialised"
+            return False, "client_not_initialised", 0
 
         try:
             from py_clob_client.clob_types import LimitOrderArgs, OrderType
@@ -524,27 +720,82 @@ class PolymarketExecutor:
 
             if status in ("matched", "live", "open"):
                 logging.info(f"[LIVE] Limit sell live: {order_id} status={status}")
-                return True, order_id
+                return True, order_id, limit_price
             else:
                 logging.warning(f"[LIVE] Limit sell rejected: {resp}")
-                return False, status
+                return False, status, 0
 
         except Exception as e:
             logging.error(f"place_sell error: {e}")
-            return False, str(e)
+            return False, str(e), 0
 
 
-# ==================== COPY TRADER ====================
+# ==================== COPY TRADER with Real-Time PnL ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
         self.positions: Dict[str, Position] = {}
         self.executor = PolymarketExecutor(dry_run)
         self.balance = RobustBalanceManager()
-        self.ws_manager = WebSocketPriceManager()
+        self.ws_manager = RealTimeWebSocketManager()
+        self._pnl_update_queue: deque = deque(maxlen=1000)  # Track recent PnL updates
 
-    # ========== PnL Methods (merged from Rust bot) ==========
+    # ========== PnL Methods ==========
     
+    async def on_price_update(self, token_id: str, best_bid: float, best_ask: float):
+        """
+        Callback triggered on every WebSocket price update.
+        Updates PnL in real-time (millisecond latency).
+        """
+        for pos_key, pos in self.positions.items():
+            if pos.token_id == token_id and pos.status == "open":
+                old_pnl = pos.unrealized_pnl
+                new_pnl = pos.calculate_unrealized_pnl(best_bid, best_ask)
+                
+                # Track PnL change for logging
+                self._pnl_update_queue.append({
+                    "token_id": token_id,
+                    "old_pnl": old_pnl,
+                    "new_pnl": new_pnl,
+                    "timestamp": datetime.now()
+                })
+                
+                # Check for stop loss / take profit conditions on every price update
+                await self._check_risk_conditions(pos, best_bid, best_ask)
+                
+                if abs(new_pnl - old_pnl) > 0.01:  # Only log meaningful changes
+                    logging.debug(f"⚡ Real-time PnL | {pos.question[:30]} | ${new_pnl:+.2f} (Δ: ${new_pnl - old_pnl:+.2f})")
+    
+    async def _check_risk_conditions(self, pos: Position, best_bid: float, best_ask: float):
+        """
+        Check stop loss and take profit conditions on every price update.
+        TP/SL decisions are based on real liquidity and actual market depth.
+        """
+        if pos.status != "open":
+            return
+            
+        current_price = best_bid if pos.side == "BUY" else best_ask
+        
+        if current_price <= 0:
+            return
+            
+        # Update peak price for trailing stop
+        if current_price > pos.peak_price:
+            pos.peak_price = current_price
+            
+        # Hard stop loss (50% below entry)
+        if current_price <= pos.entry_price * (1 - STOP_LOSS):
+            logging.warning(f"🔴 STOP LOSS TRIGGERED | {pos.question[:40]} | Entry: ${pos.entry_price:.4f} Current: ${current_price:.4f}")
+            # Signal to close position (handled in main loop)
+            pos.pnl = pos.unrealized_pnl  # Store current PnL
+            pos.status = "closing"  # Mark for closure
+            
+        # Trailing stop (25% below peak)
+        elif pos.peak_price > 0 and current_price <= pos.peak_price * (1 - TRAIL_STOP):
+            logging.warning(f"🔴 TRAILING STOP TRIGGERED | {pos.question[:40]} | Peak: ${pos.peak_price:.4f} Current: ${current_price:.4f}")
+            pos.pnl = pos.unrealized_pnl
+            pos.status = "closing"
+
     def get_wallet_stats(self) -> Dict[str, dict]:
         stats: Dict[str, dict] = {}
         for pos in self.positions.values():
@@ -570,16 +821,35 @@ class CopyTrader:
         return stats
 
     def total_unrealized_pnl(self) -> float:
-        return sum(pos.pnl_unrealized() for pos in self.positions.values() if pos.status == "open")
+        return sum(pos.unrealized_pnl for pos in self.positions.values() if pos.status == "open")
 
     def total_realized_pnl(self) -> float:
-        return sum(pos.pnl for pos in self.positions.values() if pos.status == "closed")
+        return sum(pos.realized_pnl for pos in self.positions.values())
 
     def total_pnl(self) -> float:
         return self.total_unrealized_pnl() + self.total_realized_pnl()
 
     def total_open_value(self) -> float:
         return sum(pos.current_value() for pos in self.positions.values() if pos.status == "open")
+
+    def check_daily_loss(self):
+        """Track daily loss and halt bot if limit exceeded."""
+        global daily_loss_today, last_loss_reset_date, bot_paused_until
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != last_loss_reset_date:
+            daily_loss_today = 0.0
+            last_loss_reset_date = today
+            logging.info(f"Daily loss counter reset for {today}")
+        
+        # Calculate total realized loss today
+        for pos in self.positions.values():
+            if pos.status == "closed" and pos.pnl < 0:
+                if pos.opened_at.date() == datetime.now().date():
+                    daily_loss_today += abs(pos.pnl)
+        
+        if daily_loss_today >= DAILY_LOSS_LIMIT:
+            halt_bot()
 
     # -------- helpers --------
 
@@ -680,18 +950,6 @@ class CopyTrader:
             logging.warning(f"get_orderbook error for {token_id[:12]}…: {e}")
         return 0.0, 0.0
 
-    async def get_mid_price(self, session: aiohttp.ClientSession, token_id: str) -> float:
-        # First try WebSocket cache
-        ws_price = self.ws_manager.get_price(token_id)
-        if ws_price > 0:
-            return ws_price
-        
-        # Fallback to REST API
-        bb, ba = await self.get_orderbook(session, token_id)
-        if bb and ba:
-            return (bb + ba) / 2
-        return bb or ba or 0.0
-
     # -------- source wallet tracking --------
 
     async def _get_source_position(
@@ -727,72 +985,32 @@ class CopyTrader:
             logging.warning(f"_get_source_position error ({wallet_addr[:10]}…): {e}")
             return {"_network_error": True}
 
-    # ========== WEBSOCKET-POWERED PnL UPDATE ==========
+    # ========== REAL-TIME PnL UPDATE (WebSocket driven) ==========
     
-    async def update_positions_pnl(self, session: aiohttp.ClientSession):
+    async def update_positions_pnl_realtime(self):
         """
-        Update PnL for all open positions using WebSocket price feed.
-        Subscribes to new tokens and gets latest prices from cache.
+        Real-time PnL is handled by WebSocket callbacks.
+        This method ensures all positions are subscribed and initializes PnL.
         """
         if not self.positions:
-            logging.debug("No positions to update PnL for")
             return
         
         open_positions = [p for p in self.positions.values() if p.status == "open"]
-        logging.info(f"Updating PnL for {len(open_positions)} open positions via WebSocket")
         
-        # Subscribe to all open position token_ids
         for pos in open_positions:
+            # Subscribe to real-time order book updates
             await self.ws_manager.subscribe(pos.token_id)
-        
-        # Update each position with cached WebSocket price
-        for pos in open_positions:
-            # Get latest price from WebSocket cache
-            ws_price = self.ws_manager.get_price(pos.token_id)
             
-            if ws_price > 0:
-                old_price = pos.current_price
-                pos.current_price = ws_price
-                
-                # Update peak price for trailing stop
-                if pos.peak_price <= 0:
-                    pos.peak_price = pos.entry_price
-                if ws_price > pos.peak_price:
-                    pos.peak_price = ws_price
-                
-                # Calculate unrealized PnL using Rust formula
-                unrealized = pos.pnl_unrealized()
-                pos.pnl = unrealized
-                
-                logging.info(
-                    f"📊 WS PnL | {pos.question[:35]} | "
-                    f"${pos.entry_price:.4f} → ${ws_price:.4f} | "
-                    f"Size: ${pos.size_usd:.2f} | "
-                    f"PnL: ${unrealized:+.2f} ({pos.pnl_pct():+.1f}%)"
-                )
-            else:
-                # Fallback to REST API if WebSocket doesn't have price yet
-                mid_price = await self.get_mid_price(session, pos.token_id)
-                if mid_price > 0:
-                    pos.current_price = mid_price
-                    if pos.peak_price <= 0:
-                        pos.peak_price = pos.entry_price
-                    if mid_price > pos.peak_price:
-                        pos.peak_price = mid_price
-                    
-                    unrealized = pos.pnl_unrealized()
-                    pos.pnl = unrealized
-                    
-                    logging.info(
-                        f"📊 REST PnL | {pos.question[:35]} | "
-                        f"${pos.entry_price:.4f} → ${mid_price:.4f} | "
-                        f"PnL: ${unrealized:+.2f}"
-                    )
-                    
-                    # Subscribe for future WebSocket updates
-                    await self.ws_manager.subscribe(pos.token_id)
-                else:
-                    logging.warning(f"Could not get price for {pos.token_id[:12]}... | PnL not updated")
+            # Register callback for this position
+            self.ws_manager.register_callback(pos.token_id, self.on_price_update)
+            
+            # Initialize with current best bid/ask if available
+            best_bid = self.ws_manager.get_best_bid(pos.token_id)
+            best_ask = self.ws_manager.get_best_ask(pos.token_id)
+            
+            if best_bid > 0 and best_ask > 0:
+                pos.calculate_unrealized_pnl(best_bid, best_ask)
+                logging.info(f"📊 Initialized real-time PnL for {pos.question[:35]}: ${pos.unrealized_pnl:+.2f}")
 
     # -------- execute + refresh --------
 
@@ -805,19 +1023,19 @@ class CopyTrader:
         size_usd: float,
         price: float,
         best_ask: float = 0.0,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, float]:
         if action == "BUY":
             ask = best_ask if best_ask > 0 else price
-            ok, oid = await self.executor.place_limit_buy(token_id, size_usd, ask)
+            ok, oid, exec_price = await self.executor.place_limit_buy(token_id, size_usd, ask)
         else:
-            ok, oid = await self.executor.place_sell(token_id, shares, price)
+            ok, oid, exec_price = await self.executor.place_sell(token_id, shares, price)
 
         if ok:
             delta = -size_usd if action == "BUY" else size_usd
             self.balance.adjust(delta)
             asyncio.ensure_future(self.balance.get(session, force=True))
 
-        return ok, oid
+        return ok, oid, exec_price
 
     # -------- exit scanner --------
 
@@ -846,6 +1064,11 @@ class CopyTrader:
         for pos_key, pos in list(self.positions.items()):
             if pos.status != "open":
                 continue
+            
+            # Also check positions marked "closing" from real-time risk checks
+            if pos.status == "closing":
+                to_close.append((pos_key, pos, pos.current_price, "real_time_risk"))
+                continue
 
             if pos.source_wallet in wallet_error:
                 continue
@@ -853,52 +1076,59 @@ class CopyTrader:
             snapshot = wallet_snapshot.get(pos.source_wallet, {})
             source_raw = snapshot.get(pos.token_id)
 
-            # Get current price (prefer WebSocket cache)
-            mid_price = self.ws_manager.get_price(pos.token_id)
-            if mid_price <= 0:
-                mid_price = await self.get_mid_price(session, pos.token_id)
+            # Use real-time WebSocket prices
+            current_bid = self.ws_manager.get_best_bid(pos.token_id)
+            if current_bid <= 0:
+                current_bid, _ = await self.get_orderbook(session, pos.token_id)
 
-            if mid_price > 0:
-                pos.current_price = mid_price
+            if current_bid > 0:
+                pos.current_best_bid = current_bid
+                pos.current_price = current_bid
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
-                if mid_price > pos.peak_price:
-                    pos.peak_price = mid_price
+                if current_bid > pos.peak_price:
+                    pos.peak_price = current_bid
+                    
+                # Update PnL
+                pos.calculate_unrealized_pnl(current_bid, self.ws_manager.get_best_ask(pos.token_id))
 
             src_val = float(source_raw.get("currentValue") or source_raw.get("value") or 0) if source_raw else 0
             logging.info(
                 f"  CHECK {pos.question[:45]} | "
-                f"mid={mid_price:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
-                f"source={'$'+str(round(src_val,2)) if source_raw else 'EXITED'}"
+                f"bid={current_bid:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
+                f"PnL=${pos.unrealized_pnl:+.2f} source={'$'+str(round(src_val,2)) if source_raw else 'EXITED'}"
             )
 
             reason = None
 
             if source_raw is None:
                 reason = "source_exited"
-            elif mid_price > 0 and mid_price <= pos.entry_price * (1 - STOP_LOSS):
-                reason = f"stop_loss_50% (entry={pos.entry_price:.3f} now={mid_price:.3f})"
-            elif mid_price > 0 and pos.peak_price > 0 and mid_price <= pos.peak_price * (1 - TRAIL_STOP):
-                reason = f"trail_stop_25% (peak={pos.peak_price:.3f} now={mid_price:.3f})"
+            elif current_bid > 0 and current_bid <= pos.entry_price * (1 - STOP_LOSS):
+                reason = f"stop_loss_50% (entry={pos.entry_price:.3f} now={current_bid:.3f})"
+            elif current_bid > 0 and pos.peak_price > 0 and current_bid <= pos.peak_price * (1 - TRAIL_STOP):
+                reason = f"trail_stop_25% (peak={pos.peak_price:.3f} now={current_bid:.3f})"
 
             if reason:
-                to_close.append((pos_key, pos, mid_price or pos.entry_price, reason))
+                to_close.append((pos_key, pos, current_bid or pos.entry_price, reason))
 
         for pos_key, pos, exit_price, reason in to_close:
-            ok, _ = await self._execute_and_refresh(
+            ok, _, exec_price = await self._execute_and_refresh(
                 session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price
             )
             if ok:
                 # Unsubscribe from WebSocket before closing
                 await self.ws_manager.unsubscribe(pos.token_id)
                 
+                # Update realized PnL
+                pos.update_realized_pnl(pos.shares, exec_price)
                 pos.status = "closed"
-                pos.exit_price = exit_price
-                pos.pnl = (exit_price - pos.entry_price) * pos.shares
+                pos.exit_price = exec_price
+                pos.pnl = pos.realized_pnl
+                
                 logging.info(
                     f"CLOSED [{reason}] {pos.question[:50]} | "
-                    f"entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
-                    f"exit={pos.exit_price:.3f} pnl=${pos.pnl:+.2f}"
+                    f"entry={pos.entry_price:.3f} WAP exit={pos.exit_price:.3f} "
+                    f"realized_pnl=${pos.realized_pnl:+.2f}"
                 )
                 del self.positions[pos_key]
 
@@ -932,11 +1162,15 @@ class CopyTrader:
             logging.info(
                 f"Scanning | bankroll=${bankroll:.4f} | peak=${peak_bankroll:.4f} | "
                 f"open={open_count}/{MAX_POSITIONS} | "
-                f"exposure=${self._total_exposure():.2f}"
+                f"exposure=${self._total_exposure():.2f} | "
+                f"total_pnl=${self.total_pnl():+.2f}"
             )
 
-            # Update PnL using WebSocket price feed
-            await self.update_positions_pnl(session)
+            # Update real-time PnL subscriptions
+            await self.update_positions_pnl_realtime()
+            
+            # Check daily loss limit
+            self.check_daily_loss()
             
             await self.scan_for_exits(session)
 
@@ -957,7 +1191,13 @@ class CopyTrader:
                     if pos["value"] < MIN_SOURCE_SIZE:
                         continue
 
-                    best_bid, best_ask = await self.get_orderbook(session, token_id)
+                    # Get real-time prices from WebSocket cache
+                    best_bid = self.ws_manager.get_best_bid(token_id)
+                    best_ask = self.ws_manager.get_best_ask(token_id)
+                    
+                    if best_bid <= 0 or best_ask <= 0:
+                        best_bid, best_ask = await self.get_orderbook(session, token_id)
+                    
                     mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
 
                     if mid_price <= 0.01:
@@ -976,38 +1216,49 @@ class CopyTrader:
 
                     shares = round(my_size / mid_price, 4)
 
-                    ok, order_id = await self._execute_and_refresh(
+                    ok, order_id, exec_price = await self._execute_and_refresh(
                         session, side, token_id, shares, my_size, mid_price,
                         best_ask=best_ask,
                     )
 
                     if ok:
-                        self.positions[pos_key] = Position(
+                        new_position = Position(
                             market_id="",
                             question=question,
                             outcome=pos["outcome"],
                             side=side,
                             token_id=token_id,
-                            entry_price=mid_price,
+                            entry_price=exec_price,
                             size_usd=my_size,
                             shares=shares,
                             source_wallet=wallet_addr,
                             source_name=config["name"],
                             order_type="LIMIT",
-                            peak_price=mid_price,
-                            current_price=mid_price,
-                            pnl=0.0,
+                            peak_price=exec_price,
+                            current_price=exec_price,
+                            current_best_bid=best_bid,
+                            current_best_ask=best_ask,
+                            total_shares_filled=shares,
+                            total_cost_usd=my_size,
                         )
-                        # Subscribe to WebSocket price feed for new position
+                        self.positions[pos_key] = new_position
+                        
+                        # Subscribe to real-time WebSocket feed
                         await self.ws_manager.subscribe(token_id)
+                        self.ws_manager.register_callback(token_id, self.on_price_update)
+                        
                         logging.info(
                             f"COPIED [{config['name']}] LIMIT {side} ${my_size:.2f} "
-                            f"@ {mid_price:.3f} ({pos['outcome']}) → {question[:50]}"
+                            f"@ {exec_price:.3f} ({shares:.4f} shares) → {question[:50]}"
                         )
 
     async def run(self):
-        logging.info(f"Bot started | dry_run={self.dry_run} | wallets={len(WALLETS)}")
-        logging.info("Using WebSocket price feed for real-time PnL updates")
+        logging.info(f"🚀 Bot started | dry_run={self.dry_run} | wallets={len(WALLETS)}")
+        logging.info(f"🔌 Using REAL-TIME WebSocket price feed (millisecond latency)")
+        logging.info(f"📐 PnL formula: (current_best_bid - WAP) × shares")
+        logging.info(f"📊 WAP tracking enabled for DCA/ladder strategies")
+        logging.info(f"🛑 Daily loss limit: ${DAILY_LOSS_LIMIT}")
+        logging.info(f"🎯 Stop loss: {STOP_LOSS*100}% | Trailing stop: {TRAIL_STOP*100}%")
         try:
             while True:
                 try:
@@ -1016,7 +1267,6 @@ class CopyTrader:
                     logging.error(f"Loop error: {e}", exc_info=True)
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
-            # Clean up WebSocket on shutdown
             await self.ws_manager.stop()
 
 
@@ -1050,10 +1300,8 @@ def run_dashboard():
                     
                     open_rows = ""
                     for p in open_positions:
-                        unrealized_pnl = p.pnl_unrealized()
-                        pnl_pct = p.pnl_pct()
-                        pnl_color = get_pnl_color(unrealized_pnl)
-                        current_price_display = f"{p.current_price:.4f}" if p.current_price > 0 else "N/A"
+                        pnl_color = get_pnl_color(p.unrealized_pnl)
+                        current_display = f"{p.current_best_bid:.4f}" if p.current_best_bid > 0 else f"{p.current_price:.4f}"
                         
                         open_rows += f"""
                         <tr>
@@ -1061,12 +1309,10 @@ def run_dashboard():
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
                             <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
                             <td style="font-family:monospace">{p.outcome}</td>
-                            <td style="font-family:monospace">${p.size_usd:.2f}</td>
-                            <td style="font-family:monospace">{p.entry_price:.4f}</td>
-                            <td style="font-family:monospace">{current_price_display}</td>
-                            <td style="font-family:monospace">{p.order_type}</td>
-                            <td><span class="status-open">OPEN</span></td>
-                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(unrealized_pnl)} ({pnl_pct:+.1f}%)</td>
+                            <td style="font-family:monospace">${p.size_usd:.2f}<br><span style="font-size:10px;color:#888">{p.shares:.4f} sh</span></td>
+                            <td style="font-family:monospace">{p.entry_price:.4f}<br><span style="font-size:10px;color:#888">WAP</span></td>
+                            <td style="font-family:monospace">{current_display}</td>
+                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(p.unrealized_pnl)}<br><span style="font-size:10px">{p.pnl_pct():+.1f}%</span></td>
                         </tr>
                         """
                     
@@ -1079,11 +1325,9 @@ def run_dashboard():
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
                             <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
                             <td style="font-family:monospace">{p.outcome}</td>
-                            <td style="font-family:monospace">${p.size_usd:.2f}</td>
+                            <td style="font-family:monospace">${p.size_usd:.2f}<br><span style="font-size:10px;color:#888">{p.shares:.4f} sh</span></td>
                             <td style="font-family:monospace">{p.entry_price:.4f}</td>
                             <td style="font-family:monospace">{p.exit_price:.4f}</td>
-                            <td style="font-family:monospace">{p.order_type}</td>
-                            <td><span class="status-closed">CLOSED</span></td>
                             <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(p.pnl)}</td>
                         </tr>
                         """
@@ -1122,7 +1366,7 @@ def run_dashboard():
                     <html>
                     <head>
                         <meta charset="utf-8">
-                        <title>CopyTrader Dashboard - WebSocket PnL</title>
+                        <title>CopyTrader - Real-Time PnL</title>
                         <meta http-equiv="refresh" content="30">
                         <style>
                             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -1150,12 +1394,13 @@ def run_dashboard():
                             .status-closed {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; background: #3f3f46; color: #a1a1aa; }}
                             .footer {{ margin-top: 20px; text-align: center; color: #666; font-size: 12px; }}
                             hr {{ border: none; border-top: 1px solid #2a2a2a; margin: 20px 0; }}
-                            .websocket-badge {{ background: #1e3a5f; color: #60a5fa; padding: 2px 8px; border-radius: 4px; font-size: 10px; margin-left: 10px; }}
+                            .live-badge {{ background: #dc2626; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; margin-left: 10px; animation: pulse 1.5s infinite; }}
+                            @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} 100% {{ opacity: 1; }} }}
                         </style>
                     </head>
                     <body>
                         <div class="container">
-                            <h1>📊 Multi-Wallet Copy Trader <span class="websocket-badge">🔌 WebSocket Real-Time PnL</span></h1>
+                            <h1>📊 Multi-Wallet Copy Trader <span class="live-badge">🔴 LIVE WebSocket</span></h1>
                             
                             <div class="stats">
                                 <div class="stat-card">
@@ -1220,7 +1465,7 @@ def run_dashboard():
                                             <tr><th>Rank</th><th>Wallet</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Total P&amp;L</th></tr>
                                         </thead>
                                         <tbody>
-                                            {leaderboard_rows if leaderboard_rows else '<tr><td colspan="6" style="text-align:center; padding:40px;">📭 No trades yet</td></tr>'}
+                                            {leaderboard_rows if leaderboard_rows else '<tr><td colspan="6" style="text-align:center; padding:40px;">📭 No trades yet</td</tr>'}
                                         </tbody>
                                     </table>
                                 </div>
@@ -1228,19 +1473,15 @@ def run_dashboard():
                             
                             <div class="section">
                                 <div class="section-header">
-                                    📈 Open Positions <span>({len(open_positions)})</span>
+                                    📈 OPEN POSITIONS <span>(Real-Time PnL)</span>
                                 </div>
                                 <div style="overflow-x: auto;">
                                     <table>
                                         <thead>
-                                            <tr>
-                                                <th>Source</th><th>Market</th><th>Side</th><th>Outcome</th>
-                                                <th>Size</th><th>Entry</th><th>Current</th>
-                                                <th>Order</th><th>Status</th><th>PnL</th>
-                                            </tr>
+                                            <tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size (USD/Shares)</th><th>Entry (WAP)</th><th>Best Bid</th><th>Unrealized PnL</th></tr>
                                         </thead>
                                         <tbody>
-                                            {open_rows if open_rows else '<tr><td colspan="10" style="text-align:center; padding:40px;">📭 No open positions</td></tr>'}
+                                            {open_rows if open_rows else '<tr><td colspan="8" style="text-align:center; padding:40px;">📭 No open positions</td</tr>'}
                                         </tbody>
                                     </table>
                                 </div>
@@ -1248,19 +1489,15 @@ def run_dashboard():
                             
                             <div class="section">
                                 <div class="section-header">
-                                    📉 Closed Positions <span>({len(closed_positions)})</span>
+                                    📉 CLOSED POSITIONS
                                 </div>
                                 <div style="overflow-x: auto;">
                                     <table>
                                         <thead>
-                                            <tr>
-                                                <th>Source</th><th>Market</th><th>Side</th><th>Outcome</th>
-                                                <th>Size</th><th>Entry</th><th>Exit</th>
-                                                <th>Order</th><th>Status</th><th>PnL</th>
-                                            </tr>
+                                            <tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size (USD/Shares)</th><th>Entry</th><th>Exit</th><th>Realized PnL</th></tr>
                                         </thead>
                                         <tbody>
-                                            {closed_rows if closed_rows else '<tr><td colspan="10" style="text-align:center; padding:40px;">📭 No closed positions</td></tr>'}
+                                            {closed_rows if closed_rows else '<tr><td colspan="8" style="text-align:center; padding:40px;">📭 No closed positions</td</tr>'}
                                         </tbody>
                                     </table>
                                 </div>
@@ -1268,8 +1505,8 @@ def run_dashboard():
                             
                             <div class="footer">
                                 <hr>
-                                <p>🔄 Auto-refresh every 30 seconds | 📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                                <p style="margin-top: 5px;">🔌 Prices via WebSocket (real-time) | 📐 PnL: (size_usd / entry_price) × current_price − size_usd (Rust)</p>
+                                <p>⚡ Real-time WebSocket price feed | 📐 PnL = (best_bid - WAP) × shares | 🔄 Auto-refresh every 30s</p>
+                                <p>📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
                             </div>
                         </div>
                     </body>
