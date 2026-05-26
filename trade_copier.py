@@ -135,6 +135,11 @@ class TradeCopier:
         if activity_type == "TRADE":
 
             if side == BUY:
+                existing_position = self.copier_wallet_tracker.get_position(condition_id, token_id)
+                if existing_position > 0:
+                    logger.info("⏩ Already holding %.4f shares of %s, skipping BUY", existing_position, activity.get('eventSlug'))
+                    return
+
                 raw_usdc = self._get_proportional_amount(usdc_size, target_tracker, "USDC", "USDC")
                 usdc_amount = self._apply_trade_size_limits(raw_usdc)
 
