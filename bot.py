@@ -57,21 +57,15 @@ LIMIT_ORDER_TICK   = 0.01                                       # place limit 1 
 HEALTH_PORT        = int(os.getenv("PORT", "8080"))
 PAUSE_HOURS        = 24                                         # pause 24h on drawdown
 
-# Polymarket contract addresses — source: docs.polymarket.com/resources/contracts
-# pUSD is held directly in the wallet as an ERC-20 token.
-# CTF/NegRisk exchanges hold pUSD as escrow while positions are open.
-#
-# NOTE: Ankr removed — PublicNode and official polygon-rpc.com are more reliable.
 POLYGON_RPCS  = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-rpc.com",
 ]
 BALANCE_OF_SELECTOR = "0x70a08231"
 PUSD_CONTRACTS = [
-    # label,              address,                                      decimals
-    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),  # wallet balance
-    ("CTF-v2",           "0xE111180000d2663C0091e4f400237545B87B996B", 6),  # v2 trading escrow
-    ("NegRisk-v2",       "0xe2222d279d744050d28e00520010520000310F59", 6),  # v2 neg-risk escrow
+    ("pUSD",             "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),
+    ("CTF-v2",           "0xE111180000d2663C0091e4f400237545B87B996B", 6),
+    ("NegRisk-v2",       "0xe2222d279d744050d28e00520010520000310F59", 6),
 ]
 
 peak_bankroll: float = BANKROLL_FALLBACK
@@ -91,36 +85,56 @@ class Position:
     shares: float
     source_wallet: str
     source_name: str
-    order_type: str = "LIMIT"   # always LIMIT for our copies
+    order_type: str = "LIMIT"
     status: str = "open"
     exit_price: float = 0.0
     pnl: float = 0.0
     opened_at: datetime = field(default_factory=datetime.now)
-    peak_price: float = 0.0                # highest mid-price seen since entry (for trailing stop)
-    current_price: float = 0.0             # last known mid-price (updated each scan for live PnL)
+    peak_price: float = 0.0
+    current_price: float = 0.0
+
+    # ========== PnL METHODS (merged from Rust bot) ==========
+    def pnl_unrealized(self) -> float:
+        """
+        Calculate unrealized PnL for open position.
+        Formula: (size_usd / entry_price) * current_price - size_usd
+        (identical to Rust's SimPosition::pnl)
+        """
+        if self.status != "open" or self.entry_price <= 0 or self.current_price <= 0:
+            return 0.0
+        tokens = self.size_usd / self.entry_price
+        return tokens * self.current_price - self.size_usd
+
+    def pnl_pct(self) -> float:
+        """
+        Calculate PnL percentage for open position.
+        Formula: (current_price - entry_price) / entry_price * 100
+        (identical to Rust's SimPosition::pnl_pct)
+        """
+        if self.status != "open" or self.entry_price <= 0:
+            return 0.0
+        return (self.current_price - self.entry_price) / self.entry_price * 100.0
+
+    def current_value(self) -> float:
+        """Current market value of the position."""
+        if self.status != "open" or self.entry_price <= 0 or self.current_price <= 0:
+            return 0.0
+        tokens = self.size_usd / self.entry_price
+        return tokens * self.current_price
+
+    def total_pnl(self) -> float:
+        """Return realized PnL if closed, unrealized if open."""
+        if self.status == "closed":
+            return self.pnl
+        return self.pnl_unrealized()
 
 
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    """
-    Fetches your tradeable USDC balance using three strategies in order:
-
-    1. RPC batch call — checks USDC.e, native USDC, CTF Exchange, and
-       NegRisk Exchange balances in a single eth_call batch per RPC node.
-       Sums all non-zero results (your funds may be split across contracts).
-
-    2. Polymarket data API — queries /value endpoint which returns your
-       portfolio value as Polymarket sees it. Good fallback if RPC is flaky.
-
-    3. Cached value — last successful read, or BANKROLL_FALLBACK from .env.
-    """
-
     def __init__(self):
         self.cached_balance = BANKROLL_FALLBACK
         self.last_update = 0
-        self._breakdown: dict[str, float] = {}   # label → amount for logging
-
-    # ── RPC helpers ──────────────────────────────────────────────────────────
+        self._breakdown: dict[str, float] = {}
 
     def _call_payload(self, contract: str, wallet: str) -> dict:
         padded = wallet.lower().replace("0x", "").zfill(64)
@@ -140,10 +154,6 @@ class RobustBalanceManager:
         decimals: int,
         wallet: str,
     ) -> Optional[float]:
-        """
-        Single balanceOf call.
-        Returns float (0.0 or greater) on success, None on network/RPC error.
-        """
         try:
             payload = self._call_payload(contract, wallet)
             async with session.post(
@@ -173,10 +183,6 @@ class RobustBalanceManager:
             return None
 
     async def _fetch_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
-        """
-        Query each contract individually. Tries RPC nodes in order; stops at
-        first responsive node. Returns summed balance or None if all unreachable.
-        """
         logging.debug(f"Fetching balance for wallet {wallet}")
         for rpc_url in POLYGON_RPCS:
             total = 0.0
@@ -205,9 +211,7 @@ class RobustBalanceManager:
 
             logging.warning(f"RPC {rpc_url} unreachable — trying next")
 
-        return None  # all RPC nodes unreachable
-
-    # ── Polymarket API fallback ───────────────────────────────────────────────
+        return None
 
     async def _fetch_polymarket_api(
         self, session: aiohttp.ClientSession, wallet: str
@@ -236,8 +240,6 @@ class RobustBalanceManager:
         except Exception as e:
             logging.warning(f"Polymarket API balance fetch failed: {e}")
         return None
-
-    # ── Public interface ──────────────────────────────────────────────────────
 
     async def get(self, session: aiohttp.ClientSession, force: bool = False) -> float:
         global peak_bankroll
@@ -276,18 +278,6 @@ class RobustBalanceManager:
 
 # ==================== EXECUTOR ====================
 class PolymarketExecutor:
-    """
-    Places LIMIT orders on Polymarket CLOB for all copy trades.
-
-    All copies are placed as GTC limit orders at a price just inside the
-    current best ask (best_ask - LIMIT_ORDER_TICK), capped at MAX_TRADE_FRAC (3% of bankroll)
-    ($0.99). This avoids taker fees and ensures we never spend ≥ $1 on any
-    single copied trade.
-
-    In DRY_RUN mode every call succeeds without hitting the network.
-    Requires py-clob-client: pip install py-clob-client
-    """
-
     def __init__(self, dry_run: bool):
         self.dry_run = dry_run
         self._client = None
@@ -325,18 +315,9 @@ class PolymarketExecutor:
         amount_usd: float,
         best_ask: float,
     ) -> tuple[bool, str]:
-        """
-        Place a GTC limit BUY for `amount_usd` (always < $1) at
-        `best_ask - LIMIT_ORDER_TICK` so we sit inside the spread.
-
-        Returns (success, order_id_or_reason).
-        """
-        # Safety: enforce ceiling before touching the exchange
-        amount_usd = min(round(amount_usd, 2), 1.0)  # hard $1 safety cap
-
-        # Limit price: 1 tick below best ask (we become the new best bid)
+        amount_usd = min(round(amount_usd, 2), 1.0)
         limit_price = round(max(best_ask - LIMIT_ORDER_TICK, 0.01), 4)
-        shares      = round(amount_usd / limit_price, 4)
+        shares = round(amount_usd / limit_price, 4)
 
         if self.dry_run:
             fake_id = f"dry-lmt-{int(time.time())}-{token_id[:8]}"
@@ -359,11 +340,10 @@ class PolymarketExecutor:
                 side="BUY",
             )
             signed_order = self._client.create_limit_order(order_args)
-            # GTC = Good Till Cancelled — stays on book until filled or cancelled
             resp = self._client.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID", "") or resp.get("id", "")
-            status   = resp.get("status", "unknown")
+            status = resp.get("status", "unknown")
 
             if status in ("matched", "live", "open"):
                 logging.info(
@@ -385,11 +365,6 @@ class PolymarketExecutor:
         shares: float,
         price: float,
     ) -> tuple[bool, str]:
-        """
-        Close a position with a limit sell at `price + LIMIT_ORDER_TICK`
-        (just above mid — we become the new best ask).
-        Falls back to a GTC limit at mid if price is already near 1.0.
-        """
         limit_price = round(min(price + LIMIT_ORDER_TICK, 0.99), 4)
 
         if self.dry_run:
@@ -415,7 +390,7 @@ class PolymarketExecutor:
             resp = self._client.post_order(signed_order, OrderType.GTC)
 
             order_id = resp.get("orderID", "") or resp.get("id", "")
-            status   = resp.get("status", "unknown")
+            status = resp.get("status", "unknown")
 
             if status in ("matched", "live", "open"):
                 logging.info(f"[LIVE] Limit sell live: {order_id} status={status}")
@@ -437,20 +412,56 @@ class CopyTrader:
         self.executor = PolymarketExecutor(dry_run)
         self.balance = RobustBalanceManager()
 
+    # ========== PnL Methods (merged from Rust bot) ==========
+    
+    def get_wallet_stats(self) -> Dict[str, dict]:
+        """
+        Return PnL statistics per source wallet (like Rust leaderboard).
+        Returns dict with keys: profit_trades, loss_trades, total_pnl, win_rate
+        """
+        stats: Dict[str, dict] = {}
+        for pos in self.positions.values():
+            wallet = pos.source_wallet
+            if wallet not in stats:
+                stats[wallet] = {
+                    "profit_trades": 0,
+                    "loss_trades": 0,
+                    "total_pnl": 0.0,
+                    "wallet_name": pos.source_name,
+                }
+            pnl_val = pos.total_pnl()
+            stats[wallet]["total_pnl"] += pnl_val
+            if pnl_val >= 0:
+                stats[wallet]["profit_trades"] += 1
+            else:
+                stats[wallet]["loss_trades"] += 1
+        
+        # Add win rate percentage
+        for wallet in stats:
+            total = stats[wallet]["profit_trades"] + stats[wallet]["loss_trades"]
+            stats[wallet]["win_rate"] = (stats[wallet]["profit_trades"] / total * 100.0) if total > 0 else 0.0
+        
+        return stats
+
+    def total_unrealized_pnl(self) -> float:
+        """Total unrealized PnL across all open positions."""
+        return sum(pos.pnl_unrealized() for pos in self.positions.values() if pos.status == "open")
+
+    def total_realized_pnl(self) -> float:
+        """Total realized PnL from closed positions."""
+        return sum(pos.pnl for pos in self.positions.values() if pos.status == "closed")
+
+    def total_pnl(self) -> float:
+        """Combined realized + unrealized PnL (like Rust's total_pnl)."""
+        return self.total_unrealized_pnl() + self.total_realized_pnl()
+
+    def total_open_value(self) -> float:
+        """Current market value of all open positions."""
+        return sum(pos.current_value() for pos in self.positions.values() if pos.status == "open")
+
     # -------- helpers --------
 
     def _trade_size(self, bankroll: float, wallet_addr: str, mid_price: float) -> float:
-        """
-        Compute trade size in USD as a fraction of bankroll.
-
-        Sizing logic:
-        - fixed risk_type: use fixed_risk fraction of bankroll
-        - price_based: fraction scales with mid_price
-
-        Hard limits applied in order:
-        1. Clamp fraction to [MIN_TRADE_FRAC (0.6%), MAX_TRADE_FRAC (3%)]
-        2. Never exceed available headroom
-        """
         config = WALLETS[wallet_addr]
         risk_type = config.get("risk_type", "fixed")
 
@@ -459,11 +470,9 @@ class CopyTrader:
         else:
             fraction = config.get("fixed_risk", MAX_TRADE_FRAC)
 
-        # Clamp between 0.6% and 3% of bankroll
         fraction = max(MIN_TRADE_FRAC, min(fraction, MAX_TRADE_FRAC))
         size = round(bankroll * fraction, 2)
 
-        # Cap to available headroom
         headroom = max(0.0, bankroll * MAX_EXPOSURE - self._total_exposure())
         size = min(size, round(headroom, 2))
 
@@ -503,12 +512,9 @@ class CopyTrader:
                     if not token_id:
                         continue
 
-                    # currentValue / value = dollar value of the position
-                    # size / shares = number of shares held (never use for $ filter)
                     value = float(p.get("currentValue") or p.get("value") or 0)
                     shares = float(p.get("size") or p.get("shares") or 0)
 
-                    # Fall back to shares × price only if no dollar value provided
                     if value == 0 and shares > 0:
                         price_hint = float(p.get("price") or p.get("lastTradePrice") or 0)
                         value = shares * price_hint
@@ -538,10 +544,6 @@ class CopyTrader:
     async def get_orderbook(
         self, session: aiohttp.ClientSession, token_id: str
     ) -> tuple[float, float]:
-        """
-        Returns (best_bid, best_ask). Both 0.0 if unavailable.
-        Used to set limit price (inside spread) and compute mid.
-        """
         try:
             url = f"https://clob.polymarket.com/book?token_id={token_id}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
@@ -570,13 +572,6 @@ class CopyTrader:
         wallet_addr: str,
         token_id: str,
     ) -> Optional[dict]:
-        """
-        Fetch source wallet's position for token_id with NO value floor —
-        we want to detect the position even if it has dropped below $1,
-        so we don't falsely treat a shrinking position as "exited".
-        Returns None only when the token is genuinely absent.
-        Returns {"_network_error": True} on API failure.
-        """
         try:
             url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
@@ -588,7 +583,7 @@ class CopyTrader:
                 match = next((p for p in positions if p.get("asset") == token_id), None)
                 if match is None:
                     return None
-                value  = float(match.get("currentValue") or match.get("value") or match.get("size") or 0)
+                value = float(match.get("currentValue") or match.get("value") or match.get("size") or 0)
                 shares = float(match.get("size") or match.get("shares") or 0)
                 raw_side = (match.get("side") or "").upper()
                 side = raw_side if raw_side in ("BUY", "SELL") else ("SELL" if value < 0 else "BUY")
@@ -609,38 +604,29 @@ class CopyTrader:
     async def update_positions_pnl(self, session: aiohttp.ClientSession):
         """
         Update PnL for all open positions based on current market prices.
-        This does NOT close positions, only updates the pnl and current_price fields.
+        Uses Rust formulas for PnL calculation.
         """
         for pos_key, pos in self.positions.items():
             if pos.status != "open":
                 continue
             
-            # Get current mid price for this position
             mid_price = await self.get_mid_price(session, pos.token_id)
             
             if mid_price > 0:
-                # Update current price
                 pos.current_price = mid_price
                 
-                # Update peak price for trailing stop calculation
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
                 if mid_price > pos.peak_price:
                     pos.peak_price = mid_price
                 
-                # Calculate unrealized PnL
-                if pos.side == "BUY":
-                    unrealized_pnl = (mid_price - pos.entry_price) * pos.shares
-                else:  # SELL side (shorts)
-                    unrealized_pnl = (pos.entry_price - mid_price) * pos.shares
-                
-                # Store in pnl field (this will show unrealized PnL for open positions)
-                pos.pnl = unrealized_pnl
+                # Update pnl field using Rust formula
+                pos.pnl = pos.pnl_unrealized()
                 
                 logging.debug(
                     f"PnL UPDATE {pos.question[:40]} | "
                     f"price={mid_price:.4f} entry={pos.entry_price:.4f} "
-                    f"unrealized PnL=${unrealized_pnl:+.2f}"
+                    f"unrealized PnL=${pos.pnl:+.2f} ({pos.pnl_pct():+.1f}%)"
                 )
 
     # -------- execute + refresh --------
@@ -648,7 +634,7 @@ class CopyTrader:
     async def _execute_and_refresh(
         self,
         session: aiohttp.ClientSession,
-        action: str,           # "BUY" or "SELL"
+        action: str,
         token_id: str,
         shares: float,
         size_usd: float,
@@ -671,18 +657,7 @@ class CopyTrader:
     # -------- exit scanner --------
 
     async def scan_for_exits(self, session: aiohttp.ClientSession):
-        """
-        Close a position when ANY of these conditions are met:
-        1. Source wallet no longer holds the token (copy-exit).
-        2. Price dropped ≥ 50% below entry (hard stop-loss).
-        3. Price dropped ≥ 25% below the position's peak price (trailing stop).
-
-        Fetches each source wallet ONCE per cycle (not once per position)
-        to avoid hammering the API with 54 sequential calls.
-        Network errors are ignored — never close on a flaky API response.
-        """
-        # ── Step 1: fetch each source wallet once ────────────────────────────
-        wallet_snapshot: dict[str, dict] = {}  # wallet_addr → {token_id: position_dict}
+        wallet_snapshot: dict[str, dict] = {}
         wallet_error: set[str] = set()
 
         for wallet_addr in set(p.source_wallet for p in self.positions.values() if p.status == "open"):
@@ -701,24 +676,20 @@ class CopyTrader:
                 logging.warning(f"scan_for_exits fetch error ({wallet_addr[:10]}…): {e} — holding all")
                 wallet_error.add(wallet_addr)
 
-        # ── Step 2: evaluate each open position against snapshot ─────────────
         to_close: list[tuple[str, Position, float, str]] = []
 
         for pos_key, pos in list(self.positions.items()):
             if pos.status != "open":
                 continue
 
-            # Skip on network error — never close on bad data
             if pos.source_wallet in wallet_error:
                 continue
 
             snapshot = wallet_snapshot.get(pos.source_wallet, {})
             source_raw = snapshot.get(pos.token_id)
 
-            # Get current mid price
             mid_price = await self.get_mid_price(session, pos.token_id)
 
-            # Update live price tracking
             if mid_price > 0:
                 pos.current_price = mid_price
                 if pos.peak_price <= 0:
@@ -745,15 +716,14 @@ class CopyTrader:
             if reason:
                 to_close.append((pos_key, pos, mid_price or pos.entry_price, reason))
 
-        # ── Step 3: execute closes ────────────────────────────────────────────
         for pos_key, pos, exit_price, reason in to_close:
             ok, _ = await self._execute_and_refresh(
                 session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price
             )
             if ok:
-                pos.status     = "closed"
+                pos.status = "closed"
                 pos.exit_price = exit_price
-                pos.pnl        = (exit_price - pos.entry_price) * pos.shares
+                pos.pnl = (exit_price - pos.entry_price) * pos.shares
                 logging.info(
                     f"CLOSED [{reason}] {pos.question[:50]} | "
                     f"entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
@@ -790,7 +760,7 @@ class CopyTrader:
                 f"exposure=${self._total_exposure():.2f}"
             )
 
-            # Update PnL for all open positions first
+            # Update PnL for all open positions using Rust formulas
             await self.update_positions_pnl(session)
             
             await self.scan_for_exits(session)
@@ -803,8 +773,8 @@ class CopyTrader:
                 for pos in raw:
                     token_id = pos["asset"]
                     question = pos["title"]
-                    side     = pos["side"]
-                    pos_key  = f"{wallet_addr}_{token_id}_{side}"
+                    side = pos["side"]
+                    pos_key = f"{wallet_addr}_{token_id}_{side}"
 
                     if pos_key in self.positions:
                         continue
@@ -838,20 +808,20 @@ class CopyTrader:
 
                     if ok:
                         self.positions[pos_key] = Position(
-                            market_id    = "",
-                            question     = question,
-                            outcome      = pos["outcome"],
-                            side         = side,
-                            token_id     = token_id,
-                            entry_price  = mid_price,
-                            size_usd     = my_size,
-                            shares       = shares,
-                            source_wallet= wallet_addr,
-                            source_name  = config["name"],
-                            order_type   = "LIMIT",
-                            peak_price   = mid_price,
-                            current_price = mid_price,  # Initialize current price
-                            pnl          = 0.0,  # Initialize PnL
+                            market_id="",
+                            question=question,
+                            outcome=pos["outcome"],
+                            side=side,
+                            token_id=token_id,
+                            entry_price=mid_price,
+                            size_usd=my_size,
+                            shares=shares,
+                            source_wallet=wallet_addr,
+                            source_name=config["name"],
+                            order_type="LIMIT",
+                            peak_price=mid_price,
+                            current_price=mid_price,
+                            pnl=0.0,
                         )
                         logging.info(
                             f"COPIED [{config['name']}] LIMIT {side} ${my_size:.2f} "
@@ -881,17 +851,20 @@ def run_dashboard():
                     open_positions = [p for p in bot.positions.values() if p.status == "open"]
                     closed_positions = [p for p in bot.positions.values() if p.status == "closed"]
                     
-                    # Calculate total PnL
-                    total_pnl = sum(p.pnl for p in bot.positions.values())
-                    total_open_pnl = sum(p.pnl for p in open_positions)
-                    total_closed_pnl = sum(p.pnl for p in closed_positions)
+                    # Calculate PnL using Rust formulas
+                    total_pnl = bot.total_pnl()
+                    total_open_pnl = bot.total_unrealized_pnl()
+                    total_closed_pnl = bot.total_realized_pnl()
+                    
+                    # Wallet stats leaderboard
+                    wallet_stats = bot.get_wallet_stats()
                     
                     def get_pnl_color(pnl):
                         if pnl > 0:
-                            return "#4ade80"  # green
+                            return "#4ade80"
                         elif pnl < 0:
-                            return "#f87171"  # red
-                        return "#e0e0e0"  # white/gray
+                            return "#f87171"
+                        return "#e0e0e0"
                     
                     def format_pnl(pnl):
                         return f"${pnl:+.2f}"
@@ -899,27 +872,23 @@ def run_dashboard():
                     # Build table rows for open positions
                     open_rows = ""
                     for p in open_positions:
-                        # Calculate unrealized PnL properly
-                        if p.side == "BUY":
-                            unrealized_pnl = (p.current_price - p.entry_price) * p.shares
-                        else:
-                            unrealized_pnl = (p.entry_price - p.current_price) * p.shares
-                        
+                        unrealized_pnl = p.pnl_unrealized()
+                        pnl_pct = p.pnl_pct()
                         pnl_color = get_pnl_color(unrealized_pnl)
                         current_price_display = f"{p.current_price:.4f}" if p.current_price > 0 else "N/A"
                         
                         open_rows += f"""
                         <tr>
-                            <td>{p.source_name}</td>
+                            <td style="font-family:monospace">{p.source_name}</td>
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
                             <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
-                            <td>{p.outcome}</td>
-                            <td>${p.size_usd:.2f}</td>
-                            <td>{p.entry_price:.4f}</td>
-                            <td>{current_price_display}</td>
-                            <td>{p.order_type}</td>
+                            <td style="font-family:monospace">{p.outcome}</td>
+                            <td style="font-family:monospace">${p.size_usd:.2f}</td>
+                            <td style="font-family:monospace">{p.entry_price:.4f}</td>
+                            <td style="font-family:monospace">{current_price_display}</td>
+                            <td style="font-family:monospace">{p.order_type}</td>
                             <td><span class="status-open">OPEN</span></td>
-                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(unrealized_pnl)}</td>
+                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(unrealized_pnl)} ({pnl_pct:+.1f}%)</td>
                         </tr>
                         """
                     
@@ -929,16 +898,37 @@ def run_dashboard():
                         pnl_color = get_pnl_color(p.pnl)
                         closed_rows += f"""
                         <tr>
-                            <td>{p.source_name}</td>
+                            <td style="font-family:monospace">{p.source_name}</td>
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
                             <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
-                            <td>{p.outcome}</td>
-                            <td>${p.size_usd:.2f}</td>
-                            <td>{p.entry_price:.4f}</td>
-                            <td>{p.exit_price:.4f}</td>
-                            <td>{p.order_type}</td>
+                            <td style="font-family:monospace">{p.outcome}</td>
+                            <td style="font-family:monospace">${p.size_usd:.2f}</td>
+                            <td style="font-family:monospace">{p.entry_price:.4f}</td>
+                            <td style="font-family:monospace">{p.exit_price:.4f}</td>
+                            <td style="font-family:monospace">{p.order_type}</td>
                             <td><span class="status-closed">CLOSED</span></td>
                             <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(p.pnl)}</td>
+                        </tr>
+                        """
+                    
+                    # Wallet leaderboard rows
+                    leaderboard_rows = ""
+                    sorted_wallets = sorted(
+                        wallet_stats.items(),
+                        key=lambda x: (x[1]["profit_trades"], x[1]["total_pnl"]),
+                        reverse=True
+                    )
+                    for rank, (wallet, stats) in enumerate(sorted_wallets, 1):
+                        short_wallet = f"{wallet[:8]}..."
+                        win_rate_display = f"{stats['win_rate']:.1f}%" if stats['win_rate'] > 0 else "—"
+                        leaderboard_rows += f"""
+                        <tr>
+                            <td style="font-family:monospace">#{rank}</td>
+                            <td style="font-family:monospace">{short_wallet}</td>
+                            <td style="font-family:monospace">{stats['profit_trades']}</td>
+                            <td style="font-family:monospace">{stats['loss_trades']}</td>
+                            <td style="font-family:monospace">{win_rate_display}</td>
+                            <td style="font-family:monospace; color:{'#4ade80' if stats['total_pnl'] >= 0 else '#f87171'}">${stats['total_pnl']:+.2f}</td>
                         </tr>
                         """
                     
@@ -948,7 +938,6 @@ def run_dashboard():
                         else "Active"
                     )
                     
-                    # Calculate drawdown
                     drawdown_pct = 0
                     if peak_bankroll > 0:
                         drawdown_pct = ((peak_bankroll - bankroll) / peak_bankroll) * 100
@@ -960,147 +949,37 @@ def run_dashboard():
                         <title>CopyTrader Dashboard</title>
                         <meta http-equiv="refresh" content="30">
                         <style>
-                            * {{
-                                margin: 0;
-                                padding: 0;
-                                box-sizing: border-box;
-                            }}
-                            body {{
-                                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                                padding: 20px;
-                                background: #0a0a0a;
-                                color: #e0e0e0;
-                            }}
-                            .container {{
-                                max-width: 1400px;
-                                margin: 0 auto;
-                            }}
-                            h1 {{
-                                color: #ffffff;
-                                margin-bottom: 20px;
-                                font-size: 28px;
-                                border-left: 4px solid #6366f1;
-                                padding-left: 15px;
-                            }}
-                            .stats {{
-                                display: grid;
-                                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                                gap: 15px;
-                                margin-bottom: 30px;
-                            }}
-                            .stat-card {{
-                                background: #1a1a1a;
-                                padding: 15px 20px;
-                                border-radius: 8px;
-                                border: 1px solid #2a2a2a;
-                            }}
-                            .stat-label {{
-                                font-size: 12px;
-                                text-transform: uppercase;
-                                color: #888;
-                                letter-spacing: 1px;
-                                margin-bottom: 8px;
-                            }}
-                            .stat-value {{
-                                font-size: 28px;
-                                font-weight: bold;
-                            }}
-                            .stat-value.positive {{
-                                color: #4ade80;
-                            }}
-                            .stat-value.negative {{
-                                color: #f87171;
-                            }}
-                            .stat-value.warning {{
-                                color: #fbbf24;
-                            }}
-                            .section {{
-                                background: #0f0f0f;
-                                border-radius: 8px;
-                                margin-bottom: 25px;
-                                border: 1px solid #1f1f1f;
-                                overflow: hidden;
-                            }}
-                            .section-header {{
-                                background: #1a1a1a;
-                                padding: 12px 20px;
-                                border-bottom: 1px solid #2a2a2a;
-                                font-weight: bold;
-                                font-size: 18px;
-                            }}
-                            .section-header span {{
-                                color: #6366f1;
-                            }}
-                            table {{
-                                width: 100%;
-                                border-collapse: collapse;
-                            }}
-                            th {{
-                                background: #141414;
-                                padding: 12px;
-                                text-align: left;
-                                font-size: 13px;
-                                font-weight: 600;
-                                color: #aaa;
-                                border-bottom: 1px solid #2a2a2a;
-                            }}
-                            td {{
-                                padding: 10px 12px;
-                                border-bottom: 1px solid #1f1f1f;
-                                font-size: 13px;
-                            }}
-                            tr:hover {{
-                                background: #151515;
-                            }}
-                            .badge {{
-                                display: inline-block;
-                                padding: 2px 8px;
-                                border-radius: 4px;
-                                font-size: 11px;
-                                font-weight: 600;
-                            }}
-                            .badge-active {{
-                                background: #064e3b;
-                                color: #4ade80;
-                            }}
-                            .badge-paused {{
-                                background: #7c2d12;
-                                color: #f97316;
-                            }}
-                            .status-open {{
-                                display: inline-block;
-                                padding: 2px 8px;
-                                border-radius: 4px;
-                                font-size: 11px;
-                                font-weight: 600;
-                                background: #1e3a5f;
-                                color: #60a5fa;
-                            }}
-                            .status-closed {{
-                                display: inline-block;
-                                padding: 2px 8px;
-                                border-radius: 4px;
-                                font-size: 11px;
-                                font-weight: 600;
-                                background: #3f3f46;
-                                color: #a1a1aa;
-                            }}
-                            .footer {{
-                                margin-top: 20px;
-                                text-align: center;
-                                color: #666;
-                                font-size: 12px;
-                            }}
-                            hr {{
-                                border: none;
-                                border-top: 1px solid #2a2a2a;
-                                margin: 20px 0;
-                            }}
+                            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background: #0a0a0a; color: #e0e0e0; }}
+                            .container {{ max-width: 1400px; margin: 0 auto; }}
+                            h1 {{ color: #ffffff; margin-bottom: 20px; font-size: 28px; border-left: 4px solid #6366f1; padding-left: 15px; }}
+                            h2 {{ color: #ffffff; margin: 20px 0 15px 0; font-size: 20px; }}
+                            .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }}
+                            .stat-card {{ background: #1a1a1a; padding: 15px 20px; border-radius: 8px; border: 1px solid #2a2a2a; }}
+                            .stat-label {{ font-size: 12px; text-transform: uppercase; color: #888; letter-spacing: 1px; margin-bottom: 8px; }}
+                            .stat-value {{ font-size: 28px; font-weight: bold; }}
+                            .stat-value.positive {{ color: #4ade80; }}
+                            .stat-value.negative {{ color: #f87171; }}
+                            .stat-value.warning {{ color: #fbbf24; }}
+                            .section {{ background: #0f0f0f; border-radius: 8px; margin-bottom: 25px; border: 1px solid #1f1f1f; overflow: hidden; }}
+                            .section-header {{ background: #1a1a1a; padding: 12px 20px; border-bottom: 1px solid #2a2a2a; font-weight: bold; font-size: 18px; }}
+                            .section-header span {{ color: #6366f1; }}
+                            table {{ width: 100%; border-collapse: collapse; }}
+                            th {{ background: #141414; padding: 12px; text-align: left; font-size: 13px; font-weight: 600; color: #aaa; border-bottom: 1px solid #2a2a2a; }}
+                            td {{ padding: 10px 12px; border-bottom: 1px solid #1f1f1f; font-size: 13px; }}
+                            tr:hover {{ background: #151515; }}
+                            .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
+                            .badge-active {{ background: #064e3b; color: #4ade80; }}
+                            .badge-paused {{ background: #7c2d12; color: #f97316; }}
+                            .status-open {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; background: #1e3a5f; color: #60a5fa; }}
+                            .status-closed {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; background: #3f3f46; color: #a1a1aa; }}
+                            .footer {{ margin-top: 20px; text-align: center; color: #666; font-size: 12px; }}
+                            hr {{ border: none; border-top: 1px solid #2a2a2a; margin: 20px 0; }}
                         </style>
                     </head>
                     <body>
                         <div class="container">
-                            <h1>📊 Multi-Wallet Copy Trader</h1>
+                            <h1>📊 Multi-Wallet Copy Trader (with Rust PnL)</h1>
                             
                             <div class="stats">
                                 <div class="stat-card">
@@ -1142,16 +1021,32 @@ def run_dashboard():
                                     </div>
                                 </div>
                                 <div class="stat-card">
-                                    <div class="stat-label">Open PnL (Unrealized)</div>
+                                    <div class="stat-label">Unrealized PnL</div>
                                     <div class="stat-value {'positive' if total_open_pnl > 0 else 'negative' if total_open_pnl < 0 else ''}">
                                         {format_pnl(total_open_pnl)}
                                     </div>
                                 </div>
                                 <div class="stat-card">
-                                    <div class="stat-label">Closed PnL (Realized)</div>
+                                    <div class="stat-label">Realized PnL</div>
                                     <div class="stat-value {'positive' if total_closed_pnl > 0 else 'negative' if total_closed_pnl < 0 else ''}">
                                         {format_pnl(total_closed_pnl)}
                                     </div>
+                                </div>
+                            </div>
+                            
+                            <div class="section">
+                                <div class="section-header">
+                                    🏆 Wallet Leaderboard <span>(by wins → total P&L)</span>
+                                </div>
+                                <div style="overflow-x: auto;">
+                                    <table>
+                                        <thead>
+                                            <tr><th>Rank</th><th>Wallet</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Total P&amp;L</th></tr>
+                                        </thead>
+                                        <tbody>
+                                            {leaderboard_rows if leaderboard_rows else '<tr><td colspan="6" style="text-align:center; padding:40px;">📭 No trades yet</td></tr>'}
+                                        </tbody>
+                                    </table>
                                 </div>
                             </div>
                             
@@ -1163,16 +1058,9 @@ def run_dashboard():
                                     <table>
                                         <thead>
                                             <tr>
-                                                <th>Source</th>
-                                                <th>Market</th>
-                                                <th>Side</th>
-                                                <th>Outcome</th>
-                                                <th>Size</th>
-                                                <th>Entry</th>
-                                                <th>Current</th>
-                                                <th>Order</th>
-                                                <th>Status</th>
-                                                <th>Unrealized PnL</th>
+                                                <th>Source</th><th>Market</th><th>Side</th><th>Outcome</th>
+                                                <th>Size</th><th>Entry</th><th>Current</th>
+                                                <th>Order</th><th>Status</th><th>PnL</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -1190,16 +1078,9 @@ def run_dashboard():
                                     <table>
                                         <thead>
                                             <tr>
-                                                <th>Source</th>
-                                                <th>Market</th>
-                                                <th>Side</th>
-                                                <th>Outcome</th>
-                                                <th>Size</th>
-                                                <th>Entry</th>
-                                                <th>Exit</th>
-                                                <th>Order</th>
-                                                <th>Status</th>
-                                                <th>Realized PnL</th>
+                                                <th>Source</th><th>Market</th><th>Side</th><th>Outcome</th>
+                                                <th>Size</th><th>Entry</th><th>Exit</th>
+                                                <th>Order</th><th>Status</th><th>PnL</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -1212,6 +1093,7 @@ def run_dashboard():
                             <div class="footer">
                                 <hr>
                                 <p>🔄 Auto-refresh every 30 seconds | 📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                                <p style="margin-top: 5px;">📐 PnL Formula: (size_usd / entry_price) × current_price − size_usd (Rust implementation)</p>
                             </div>
                         </div>
                     </body>
@@ -1246,4 +1128,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    bot = None  # type: ignore
     asyncio.run(main())
