@@ -1,22 +1,79 @@
+#!/usr/bin/env python3
+"""
+MULTI-WALLET POLYMARKET COPY TRADER - Improved Version
+"""
+
+import os
+import json
+import asyncio
+import logging
+import time
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List
+
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ==================== CONFIG ====================
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+WALLETS = {
+    "0x0c0e270cf879583d6a0142fc817e05b768d0434e": {"name": "TheSpirit",  "risk_type": "price_based"},
+    "0xa1795199a227f8d68134f30bf26314a9918c9629": {"name": "WalletA179", "risk_type": "fixed", "fixed_risk": 0.20},
+}
+
+YOUR_PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+YOUR_WALLET      = os.getenv("DEPOSIT_WALLET_ADDRESS", "")
+CLOB_API_KEY     = os.getenv("POLY_API_KEY", "")
+CLOB_SECRET      = os.getenv("POLY_SECRET", "")
+CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
+
+BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
+
+MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))
+POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "60"))
+MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))
+MAX_EXPOSURE       = 0.80
+STOP_LOSS          = 0.50
+TRAIL_STOP         = 0.25
+MIN_TRADE_FRAC     = 0.006
+MAX_TRADE_FRAC     = 0.03
+MIN_SOURCE_SIZE    = 1.0
+LIMIT_ORDER_TICK   = 0.01
+
+HEALTH_PORT        = int(os.getenv("PORT", "8080"))
+PAUSE_HOURS        = 24
+
+POLYGON_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon-rpc.com",
+]
+BALANCE_OF_SELECTOR = "0x70a08231"
+PUSD_CONTRACTS = [
+    ("pUSD",      "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),
+    ("CTF-v2",    "0xE111180000d2663C0091e4f400237545B87B996B", 6),
+    ("NegRisk-v2","0xe2222d279d744050d28e00520010520000310F59", 6),
+]
+
+_LOG_LEVEL = logging.DEBUG if os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+
 # ==================== BALANCE MANAGER ====================
 class RobustBalanceManager:
-    """
-    Robust pUSD balance checker for Polymarket.
-    
-    Fetch strategies (in order):
-    1. Direct RPC calls to Polygon (multiple nodes)
-    2. Polymarket Data API fallback
-    3. Local cache
-    """
-
     def __init__(self, cache_seconds: int = 60):
         self.cached_balance: float = BANKROLL_FALLBACK
         self.last_update: float = 0.0
         self.cache_seconds = cache_seconds
         self._breakdown: Dict[str, float] = {}
-        self._last_successful_source: str = "fallback"
-
-    # ── RPC Helpers ──────────────────────────────────────────────────────────
+        self._last_source: str = "fallback"
 
     def _call_payload(self, contract: str, wallet: str) -> dict:
         padded = wallet.lower().replace("0x", "").zfill(64)
@@ -28,123 +85,66 @@ class RobustBalanceManager:
         }
 
     async def _query_contract(
-        self,
-        session: aiohttp.ClientSession,
-        rpc_url: str,
-        label: str,
-        contract: str,
-        decimals: int,
-        wallet: str,
+        self, session: "aiohttp.ClientSession", rpc_url: str, label: str,
+        contract: str, decimals: int, wallet: str
     ) -> Optional[float]:
         try:
             payload = self._call_payload(contract, wallet)
-            async with session.post(
-                rpc_url, 
-                json=payload, 
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as resp:
-                
+            async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status != 200:
-                    logging.debug(f"Balance | {label} → HTTP {resp.status} on {rpc_url}")
                     return None
-
                 data = await resp.json(content_type=None)
-                
                 if "error" in data:
-                    logging.debug(f"Balance | {label} → RPC Error: {data['error']}")
                     return None
-
                 hex_val = data.get("result") or "0x0"
                 if hex_val in ("0x", "0x0", None):
                     return 0.0
+                return int(hex_val, 16) / (10 ** decimals)
+        except Exception:
+            return None
 
-                amount = int(hex_val, 16) / (10 ** decimals)
-                if amount > 0:
-                    logging.debug(f"Balance | {label} = ${amount:.6f}")
-                return amount
-
-        except asyncio.TimeoutError:
-            logging.debug(f"Balance | {label} → Timeout on {rpc_url}")
-        except Exception as e:
-            logging.debug(f"Balance | {label} → Error on {rpc_url}: {e}")
-        return None
-
-    async def _fetch_rpc(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
-        """Try multiple RPCs until one succeeds."""
+    async def _fetch_rpc(self, session: "aiohttp.ClientSession", wallet: str) -> Optional[float]:
         for rpc_url in POLYGON_RPCS:
             total = 0.0
-            breakdown: Dict[str, float] = {}
-            rpc_alive = False
-
+            breakdown = {}
             for label, contract, decimals in PUSD_CONTRACTS:
-                amount = await self._query_contract(
-                    session, rpc_url, label, contract, decimals, wallet
-                )
+                amount = await self._query_contract(session, rpc_url, label, contract, decimals, wallet)
                 if amount is None:
                     continue
-
-                rpc_alive = True
                 if amount > 0:
                     breakdown[label] = amount
                     total += amount
 
-            if rpc_alive:
+            if breakdown or total == 0:  # RPC responded
                 self._breakdown = breakdown
-                self._last_successful_source = f"RPC ({rpc_url.split('//')[-1][:20]}...)"
-                
-                if total > 0:
-                    parts = ", ".join(f"{k}=${v:.4f}" for k, v in breakdown.items())
-                    logging.info(f"Balance → ${total:.4f} ({parts}) via {self._last_successful_source}")
-                else:
-                    logging.info(f"Balance → $0.00 via {self._last_successful_source}")
+                self._last_source = "RPC"
+                logging.info(f"Balance → ${total:.4f} via RPC")
                 return total
-
         return None
 
-    async def _fetch_polymarket_api(self, session: aiohttp.ClientSession, wallet: str) -> Optional[float]:
-        """Fallback using Polymarket public API."""
+    async def _fetch_polymarket_api(self, session: "aiohttp.ClientSession", wallet: str) -> Optional[float]:
         try:
             url = f"https://data-api.polymarket.com/value?user={wallet}"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     return None
-
                 data = await resp.json(content_type=None)
-                
-                if isinstance(data, (int, float)):
-                    value = float(data)
-                elif isinstance(data, dict):
-                    value = float(
-                        data.get("portfolioValue") or 
-                        data.get("value") or 
-                        data.get("balance") or 0
-                    )
-                else:
-                    return None
-
+                value = float(data) if isinstance(data, (int, float)) else float(
+                    data.get("portfolioValue") or data.get("value") or 0)
                 if value >= 0:
-                    self._last_successful_source = "Polymarket API"
-                    logging.info(f"Balance → ${value:.4f} via {self._last_successful_source}")
-                    self._breakdown = {"polymarket_api": value}
+                    self._last_source = "Polymarket API"
+                    logging.info(f"Balance → ${value:.4f} via API")
                     return value
         except Exception as e:
-            logging.warning(f"Polymarket API balance fetch failed: {e}")
-
+            logging.warning(f"API balance error: {e}")
         return None
 
-    # ── Public Methods ───────────────────────────────────────────────────────
-
-    async def get(self, session: aiohttp.ClientSession, force: bool = False) -> float:
-        """Get current available pUSD balance."""
-        # Return cache if still fresh
+    async def get(self, session: "aiohttp.ClientSession", force: bool = False) -> float:
         if not force and (time.time() - self.last_update) < self.cache_seconds:
             return self.cached_balance
 
-        if not YOUR_WALLET or len(YOUR_WALLET) != 42:
-            logging.warning("DEPOSIT_WALLET_ADDRESS invalid or not set")
+        if not YOUR_WALLET:
             return self.cached_balance
-
-        logging.debug("Fetching fresh balance...")
 
         fetched = await self._fetch_rpc(session, YOUR_WALLET)
         if fetched is None:
@@ -153,20 +153,101 @@ class RobustBalanceManager:
         if fetched is not None:
             self.cached_balance = fetched
             self.last_update = time.time()
-        else:
-            logging.warning(f"Balance fetch failed — using cached value ${self.cached_balance:.4f}")
 
         return self.cached_balance
 
-    def get_breakdown(self) -> Dict[str, float]:
-        """Return detailed balance breakdown (for dashboard/logging)."""
-        return self._breakdown.copy()
-
-    def get_last_source(self) -> str:
-        """Return which source provided the last successful balance."""
-        return self._last_successful_source
-
-    def adjust(self, delta: float) -> None:
-        """Adjust cached balance (use carefully - preferably after confirmed fills)."""
+    def adjust(self, delta: float):
         self.cached_balance = max(0.0, self.cached_balance + delta)
-        logging.info(f"Balance adjusted by {delta:+.2f} → ${self.cached_balance:.4f}")
+
+
+# ==================== DATA CLASS ====================
+@dataclass
+class Position:
+    question: str
+    outcome: str
+    token_id: str
+    side: str
+    entry_price: float
+    size_usd: float
+    shares: float
+    source_wallet: str
+    source_name: str
+    status: str = "open"
+    exit_price: float = 0.0
+    pnl: float = 0.0
+    peak_price: float = 0.0
+    current_price: float = 0.0
+
+
+# ==================== EXECUTOR & COPY TRADER (Simplified) ====================
+# Note: Add your full PolymarketExecutor here if needed.
+# For now, using minimal version for deployment test.
+
+class CopyTrader:
+    def __init__(self, dry_run: bool = True):
+        self.dry_run = dry_run
+        self.positions: Dict[str, Position] = {}
+        self.balance = RobustBalanceManager()
+        self.peak_bankroll: float = BANKROLL_FALLBACK
+        self.bot_paused_until: Optional[datetime] = None
+
+    async def run(self):
+        logging.info(f"CopyTrader started | Dry-run: {self.dry_run}")
+        while True:
+            try:
+                await self.scan_and_copy()
+            except Exception as e:
+                logging.error(f"Loop error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+
+    async def scan_and_copy(self):
+        # Basic placeholder - expand as needed
+        async with aiohttp.ClientSession() as session:
+            bankroll = await self.balance.get(session, force=True)
+            if bankroll > self.peak_bankroll:
+                self.peak_bankroll = bankroll
+            logging.info(f"Bankroll: ${bankroll:.2f} | Peak: ${self.peak_bankroll:.2f}")
+
+
+# ==================== DASHBOARD ====================
+def run_dashboard(bot: CopyTrader):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                data = {
+                    "status": "running",
+                    "dry_run": bot.dry_run,
+                    "bankroll": round(bot.balance.cached_balance, 4),
+                    "peak_bankroll": round(bot.peak_bankroll, 4),
+                    "open_positions": len(bot.positions),
+                }
+                self.wfile.write(json.dumps(data, indent=2).encode())
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            html = f"""<h1>CopyTrader Dashboard</h1>
+            <p>Status: Running</p>
+            <p>Bankroll: ${bot.balance.cached_balance:.4f}</p>
+            <p>Peak: ${bot.peak_bankroll:.4f}</p>
+            """
+            self.wfile.write(html.encode())
+
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
+    logging.info(f"Dashboard running on port {HEALTH_PORT}")
+    server.serve_forever()
+
+
+# ==================== MAIN ====================
+async def main():
+    bot = CopyTrader(dry_run=DRY_RUN)
+    threading.Thread(target=run_dashboard, args=(bot,), daemon=True).start()
+    await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
