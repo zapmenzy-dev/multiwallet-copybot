@@ -80,18 +80,14 @@
         <div class="last-updated" id="last-updated">Last updated: just now</div>
     </div>
 
-    <div class="metrics" id="metrics">
-        <!-- Populated by JS -->
-    </div>
+    <div class="metrics" id="metrics"></div>
 
     <div class="chart-container">
         <h2>Cumulative PnL</h2>
         <canvas id="pnlChart" height="120"></canvas>
     </div>
 
-    <div class="wallet-grid" id="wallet-grid">
-        <!-- Populated by JS -->
-    </div>
+    <div class="wallet-grid" id="wallet-grid"></div>
 
     <script>
         let pnlChart = null;
@@ -101,7 +97,7 @@
                 const res = await fetch('/data');
                 const data = await res.json();
 
-                // Update main metrics
+                // Metrics
                 document.getElementById('metrics').innerHTML = `
                     <div class="metric-card">
                         <div class="metric-label">Balance</div>
@@ -123,25 +119,69 @@
                     </div>
                 `;
 
-                // Update wallet cards
-                const grid = document.getElementById('wallet-grid');
-                grid.innerHTML = Object.entries(data.wallets || {}).map(([name, w]) => `
+                // Wallet cards — FIX: .toFixed() instead of Python :.1f syntax
+                document.getElementById('wallet-grid').innerHTML = Object.entries(data.wallets || {}).map(([name, w]) => `
                     <div class="wallet-card">
                         <h3>${name}</h3>
-                        <p><strong>PnL:</strong> <span class="${w.total_pnl >= 0 ? 'positive' : 'negative'}">$${w.total_pnl}</span></p>
+                        <p><strong>PnL:</strong> <span class="${w.total_pnl >= 0 ? 'positive' : 'negative'}">$${Number(w.total_pnl).toFixed(2)}</span></p>
                         <p><strong>Win Rate:</strong> ${w.win_rate}% (${w.wins}W / ${w.losses}L)</p>
                         <p><strong>Open:</strong> ${w.open}</p>
                         <h4>Last Closed Trades</h4>
                         <ul>
-                            ${w.closed_trades.map(t => `
-                                <li>${t.outcome} | ${t.entry_price*100:.1f}¢ → ${t.exit_price*100:.1f}¢ | <strong>$${t.pnl}</strong></li>
+                            ${(w.closed_trades || []).map(t => `
+                                <li>${t.outcome} | ${(t.entry_price * 100).toFixed(1)}¢ → ${(t.exit_price * 100).toFixed(1)}¢ | <strong>$${Number(t.pnl).toFixed(2)}</strong></li>
                             `).join('')}
                         </ul>
                     </div>
                 `).join('');
 
-                // Update last updated
-                document.getElementById('last-updated').textContent = 
+                // PnL chart — FIX: was never rendered before
+                const history = data.pnl_history || [];
+                const labels = history.map(p => p.time);
+                const values = history.map(p => p.value);
+
+                if (!pnlChart) {
+                    pnlChart = new Chart(document.getElementById('pnlChart'), {
+                        type: 'line',
+                        data: {
+                            labels,
+                            datasets: [{
+                                label: 'Cumulative PnL ($)',
+                                data: values,
+                                borderColor: '#3b82f6',
+                                backgroundColor: 'rgba(59,130,246,0.08)',
+                                borderWidth: 2,
+                                pointRadius: 3,
+                                tension: 0.3,
+                                fill: true,
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: {
+                                legend: { display: false },
+                                tooltip: {
+                                    callbacks: {
+                                        label: ctx => `$${ctx.parsed.y.toFixed(2)}`
+                                    }
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    ticks: {
+                                        callback: val => `$${val.toFixed(0)}`
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    pnlChart.data.labels = labels;
+                    pnlChart.data.datasets[0].data = values;
+                    pnlChart.update();
+                }
+
+                document.getElementById('last-updated').textContent =
                     `Last updated: ${new Date().toLocaleTimeString()}`;
 
             } catch (e) {
@@ -149,9 +189,8 @@
             }
         }
 
-        // Auto-refresh every 5 minutes (300000 ms)
-        setInterval(fetchData, 300000);
-        fetchData(); // Initial load
+        setInterval(fetchData, 30000); // FIX: was 300000 (5 min), now 30s
+        fetchData();
     </script>
 </body>
 </html>
