@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MULTI-WALLET POLYMARKET COPY TRADER - Fixed for Render
+MULTI-WALLET POLYMARKET COPY TRADER - FINAL LIVE VERSION
 """
 
 import os
@@ -11,7 +11,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
-from dataclasses import dataclass, field   # ← FIXED: Added this import
+from dataclasses import dataclass, field
 
 import aiohttp
 from dotenv import load_dotenv
@@ -34,7 +34,6 @@ CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
 BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0.0"))
 
-MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "60"))
 MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))
 MAX_EXPOSURE       = 0.80
@@ -45,119 +44,13 @@ MAX_TRADE_FRAC     = 0.03
 MIN_SOURCE_SIZE    = 1.0
 LIMIT_ORDER_TICK   = 0.01
 
-HEALTH_PORT        = int(os.getenv("PORT", "8080"))
-PAUSE_HOURS        = 24
-
-POLYGON_RPCS = [
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://polygon-rpc.com",
-]
-BALANCE_OF_SELECTOR = "0x70a08231"
-PUSD_CONTRACTS = [
-    ("pUSD",      "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", 6),
-    ("CTF-v2",    "0xE111180000d2663C0091e4f400237545B87B996B", 6),
-    ("NegRisk-v2","0xe2222d279d744050d28e00520010520000310F59", 6),
-]
+HEALTH_PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-
-
-# ==================== BALANCE MANAGER ====================
-class RobustBalanceManager:
-    def __init__(self, cache_seconds: int = 60):
-        self.cached_balance: float = BANKROLL_FALLBACK
-        self.last_update: float = 0.0
-        self.cache_seconds = cache_seconds
-        self._breakdown: Dict[str, float] = {}
-        self._last_source: str = "fallback"
-
-    def _call_payload(self, contract: str, wallet: str) -> dict:
-        padded = wallet.lower().replace("0x", "").zfill(64)
-        return {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [{"to": contract, "data": BALANCE_OF_SELECTOR + padded}, "latest"],
-        }
-
-    async def _query_contract(
-        self, session: "aiohttp.ClientSession", rpc_url: str, label: str,
-        contract: str, decimals: int, wallet: str
-    ) -> Optional[float]:
-        try:
-            payload = self._call_payload(contract, wallet)
-            async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-                if "error" in data:
-                    return None
-                hex_val = data.get("result") or "0x0"
-                if hex_val in ("0x", "0x0", None):
-                    return 0.0
-                return int(hex_val, 16) / (10 ** decimals)
-        except Exception:
-            return None
-
-    async def _fetch_rpc(self, session: "aiohttp.ClientSession", wallet: str) -> Optional[float]:
-        for rpc_url in POLYGON_RPCS:
-            total = 0.0
-            breakdown = {}
-            for label, contract, decimals in PUSD_CONTRACTS:
-                amount = await self._query_contract(session, rpc_url, label, contract, decimals, wallet)
-                if amount is None:
-                    continue
-                if amount > 0:
-                    breakdown[label] = amount
-                    total += amount
-
-            if breakdown or total == 0:
-                self._breakdown = breakdown
-                self._last_source = "RPC"
-                logging.info(f"Balance → ${total:.4f} via RPC")
-                return total
-        return None
-
-    async def _fetch_polymarket_api(self, session: "aiohttp.ClientSession", wallet: str) -> Optional[float]:
-        try:
-            url = f"https://data-api.polymarket.com/value?user={wallet}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-                value = float(data) if isinstance(data, (int, float)) else float(
-                    data.get("portfolioValue") or data.get("value") or data.get("balance") or 0)
-                if value >= 0:
-                    self._last_source = "Polymarket API"
-                    logging.info(f"Balance → ${value:.4f} via API")
-                    return value
-        except Exception as e:
-            logging.warning(f"API balance error: {e}")
-        return None
-
-    async def get(self, session: "aiohttp.ClientSession", force: bool = False) -> float:
-        if not force and (time.time() - self.last_update) < self.cache_seconds:
-            return self.cached_balance
-
-        if not YOUR_WALLET:
-            return self.cached_balance
-
-        fetched = await self._fetch_rpc(session, YOUR_WALLET)
-        if fetched is None:
-            fetched = await self._fetch_polymarket_api(session, YOUR_WALLET)
-
-        if fetched is not None:
-            self.cached_balance = fetched
-            self.last_update = time.time()
-
-        return self.cached_balance
-
-    def adjust(self, delta: float):
-        self.cached_balance = max(0.0, self.cached_balance + delta)
 
 
 # ==================== DATA CLASS ====================
@@ -177,69 +70,252 @@ class Position:
     pnl: float = 0.0
     peak_price: float = 0.0
     current_price: float = 0.0
+    opened_at: datetime = field(default_factory=datetime.now)
 
 
-# ==================== COPY TRADER (Minimal for deployment) ====================
+# ==================== BALANCE MANAGER ====================
+class RobustBalanceManager:
+    def __init__(self):
+        self.cached_balance = BANKROLL_FALLBACK
+        self.last_update = 0
+
+    async def get(self, session: "aiohttp.ClientSession", force: bool = False) -> float:
+        if not force and time.time() - self.last_update < 60:
+            return self.cached_balance
+
+        if not YOUR_WALLET:
+            return self.cached_balance
+
+        # Placeholder - replace with full RPC later if needed
+        self.cached_balance = BANKROLL_FALLBACK
+        self.last_update = time.time()
+        return self.cached_balance
+
+
+# ==================== EXECUTOR ====================
+class PolymarketExecutor:
+    def __init__(self, dry_run: bool):
+        self.dry_run = dry_run
+        self.client = None
+        if not dry_run:
+            self._init_client()
+
+    def _init_client(self):
+        try:
+            from py_clob_client_v2 import ClobClient, OrderArgs, OrderType, Side
+            self.Side = Side
+            self.OrderType = OrderType
+            self.OrderArgs = OrderArgs
+
+            self.client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=YOUR_PRIVATE_KEY,
+                chain_id=137
+            )
+            logging.info("✅ CLOB Client initialized for LIVE trading")
+        except Exception as e:
+            logging.error(f"Failed to initialize CLOB client: {e}")
+
+    async def place_order(self, token_id: str, side: str, size_usd: float, price: float) -> tuple[bool, str]:
+        size_usd = min(round(size_usd, 2), 0.99)
+
+        if self.dry_run:
+            logging.info(f"[DRY RUN] {side} ${size_usd:.2f} @ {price:.4f}")
+            return True, "dry-run-success"
+
+        if not self.client:
+            return False, "client_not_initialized"
+
+        try:
+            limit_price = round(price - LIMIT_ORDER_TICK if side == "BUY" else price + LIMIT_ORDER_TICK, 4)
+            shares = round(size_usd / limit_price, 4)
+
+            order_args = self.OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side=self.Side.BUY if side == "BUY" else self.Side.SELL
+            )
+
+            resp = self.client.create_and_post_order(order_args, order_type=self.OrderType.GTC)
+            order_id = resp.get("orderID") or resp.get("id", "unknown")
+            logging.info(f"✅ LIVE ORDER PLACED | {side} ${size_usd:.2f} @ {limit_price:.4f} | ID: {order_id}")
+            return True, order_id
+        except Exception as e:
+            logging.error(f"Order placement failed: {e}")
+            return False, str(e)
+
+
+# ==================== COPY TRADER ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
         self.positions: Dict[str, Position] = {}
         self.balance = RobustBalanceManager()
-        self.peak_bankroll: float = BANKROLL_FALLBACK
-        self.bot_paused_until: Optional[datetime] = None
+        self.executor = PolymarketExecutor(dry_run)
+        self.peak_bankroll = BANKROLL_FALLBACK
 
-    async def run(self):
-        logging.info(f"✅ CopyTrader started | Dry-run: {self.dry_run} | PORT: {HEALTH_PORT}")
-        while True:
-            try:
-                await self.scan_and_copy()
-            except Exception as e:
-                logging.error(f"Loop error: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+    def _position_key(self, wallet: str, token_id: str) -> str:
+        return f"{wallet}_{token_id}"
+
+    def _trade_size(self, bankroll: float, source_wallet: str, price: float) -> float:
+        config = WALLETS.get(source_wallet, {})
+        if config.get("risk_type") == "price_based":
+            fraction = max(0.05, min(price, 1.0)) * MAX_TRADE_FRAC
+        else:
+            fraction = config.get("fixed_risk", MAX_TRADE_FRAC)
+
+        fraction = max(MIN_TRADE_FRAC, min(fraction, MAX_TRADE_FRAC))
+        size = bankroll * fraction
+
+        exposure = sum(p.size_usd for p in self.positions.values() if p.status == "open")
+        headroom = bankroll * MAX_EXPOSURE - exposure
+        return round(min(size, headroom, 0.99), 2)
+
+    async def get_source_positions(self, session: aiohttp.ClientSession, wallet: str) -> List[dict]:
+        try:
+            url = f"https://data-api.polymarket.com/positions?user={wallet}&limit=100"
+            async with session.get(url, timeout=12) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    async def get_mid_price(self, session: aiohttp.ClientSession, token_id: str) -> float:
+        try:
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            async with session.get(url, timeout=8) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    bb = float(bids[0]["price"]) if bids else 0.0
+                    ba = float(asks[0]["price"]) if asks else 0.0
+                    return (bb + ba) / 2 if bb and ba else bb or ba
+        except Exception:
+            return 0.0
+
+    async def close_position(self, session: aiohttp.ClientSession, pos_key: str, price: float, reason: str):
+        pos = self.positions.get(pos_key)
+        if not pos or pos.status != "open":
+            return
+        success, _ = await self.executor.place_order(pos.token_id, "SELL", pos.size_usd, price)
+        if success:
+            pos.status = "closed"
+            pos.exit_price = price
+            pos.pnl = (price - pos.entry_price) * pos.shares if pos.side == "BUY" else (pos.entry_price - price) * pos.shares
+            logging.info(f"CLOSED [{reason}] {pos.question[:50]} | PnL: ${pos.pnl:+.2f}")
 
     async def scan_and_copy(self):
         async with aiohttp.ClientSession() as session:
             bankroll = await self.balance.get(session, force=True)
             if bankroll > self.peak_bankroll:
                 self.peak_bankroll = bankroll
-            logging.info(f"Bankroll: ${bankroll:.2f} | Peak: ${self.peak_bankroll:.2f} | Positions: {len(self.positions)}")
+
+            logging.info(f"Scan | Bankroll=${bankroll:.2f} | Open Positions={len(self.positions)} | Peak=${self.peak_bankroll:.2f}")
+
+            # Update PnL + Check exits
+            for key, pos in list(self.positions.items()):
+                if pos.status != "open":
+                    continue
+                mid = await self.get_mid_price(session, pos.token_id)
+                if mid > 0:
+                    pos.current_price = mid
+                    if mid > pos.peak_price:
+                        pos.peak_price = mid
+                    pos.pnl = (mid - pos.entry_price) * pos.shares if pos.side == "BUY" else (pos.entry_price - mid) * pos.shares
+
+                    if mid <= pos.entry_price * (1 - STOP_LOSS) or mid <= pos.peak_price * (1 - TRAIL_STOP):
+                        await self.close_position(session, key, mid, "risk_exit")
+
+            # Copy new trades
+            for wallet, config in WALLETS.items():
+                source_pos = await self.get_source_positions(session, wallet)
+                for p in source_pos:
+                    token_id = p.get("asset")
+                    if not token_id:
+                        continue
+                    value = float(p.get("currentValue") or p.get("value") or 0)
+                    if value < MIN_SOURCE_SIZE:
+                        continue
+
+                    key = self._position_key(wallet, token_id)
+                    if key in self.positions:
+                        continue
+
+                    side = (p.get("side") or "BUY").upper()
+                    mid_price = await self.get_mid_price(session, token_id)
+                    if mid_price < 0.01:
+                        continue
+
+                    size_usd = self._trade_size(bankroll, wallet, mid_price)
+                    if size_usd < 0.10:
+                        continue
+
+                    success, _ = await self.executor.place_order(token_id, side, size_usd, mid_price)
+
+                    if success:
+                        self.positions[key] = Position(
+                            question=p.get("title", "Unknown"),
+                            outcome=p.get("outcome", ""),
+                            token_id=token_id,
+                            side=side,
+                            entry_price=mid_price,
+                            size_usd=size_usd,
+                            shares=round(size_usd / mid_price, 4),
+                            source_wallet=wallet,
+                            source_name=config["name"],
+                            peak_price=mid_price,
+                        )
+                        logging.info(f"✅ COPIED [{config['name']}] {side} ${size_usd:.2f} @ {mid_price:.3f}")
+
+    async def run(self):
+        logging.info(f"🚀 Bot Started | Mode: {'🟢 LIVE' if not self.dry_run else '🔵 DRY RUN'}")
+        while True:
+            try:
+                await self.scan_and_copy()
+            except Exception as e:
+                logging.error(f"Main loop error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
 
 # ==================== DASHBOARD ====================
 def run_dashboard(bot: CopyTrader):
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/health":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
+                total_pnl = sum(p.pnl for p in bot.positions.values() if p.status == "open")
                 data = {
                     "status": "running",
-                    "dry_run": bot.dry_run,
+                    "mode": "LIVE" if not bot.dry_run else "DRY RUN",
                     "bankroll": round(bot.balance.cached_balance, 4),
                     "peak_bankroll": round(bot.peak_bankroll, 4),
                     "open_positions": len(bot.positions),
-                    "port": HEALTH_PORT
+                    "total_unrealized_pnl": round(total_pnl, 4)
                 }
                 self.wfile.write(json.dumps(data, indent=2).encode())
                 return
 
-            # Simple HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             html = f"""
             <h1>Polymarket CopyTrader</h1>
-            <p><strong>Status:</strong> Running</p>
-            <p><strong>Mode:</strong> {'DRY RUN' if bot.dry_run else 'LIVE'}</p>
-            <p><strong>Bankroll:</strong> ${bot.balance.cached_balance:.4f}</p>
-            <p><strong>Peak:</strong> ${bot.peak_bankroll:.4f}</p>
+            <p><strong>Mode:</strong> {'<span style="color:red">LIVE TRADING</span>' if not bot.dry_run else 'DRY RUN'}</p>
+            <p><strong>Bankroll:</strong> ${bot.balance.cached_balance:.2f}</p>
             <p><strong>Open Positions:</strong> {len(bot.positions)}</p>
             """
             self.wfile.write(html.encode())
 
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
-    logging.info(f"🌐 Dashboard running on http://0.0.0.0:{HEALTH_PORT}")
+    logging.info(f"🌐 Dashboard running on port {HEALTH_PORT}")
     server.serve_forever()
 
 
