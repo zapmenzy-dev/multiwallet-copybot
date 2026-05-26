@@ -97,6 +97,7 @@ class Position:
     pnl: float = 0.0
     opened_at: datetime = field(default_factory=datetime.now)
     peak_price: float = 0.0                # highest mid-price seen since entry (for trailing stop)
+    current_price: float = 0.0             # last known mid-price (updated each scan for live PnL)
 
 
 # ==================== BALANCE MANAGER ====================
@@ -678,8 +679,9 @@ class CopyTrader:
             # Get current mid price
             mid_price = await self.get_mid_price(session, pos.token_id)
 
-            # Update trailing-stop peak
+            # Update live price tracking
             if mid_price > 0:
+                pos.current_price = mid_price
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
                 if mid_price > pos.peak_price:
@@ -833,6 +835,12 @@ def run_dashboard():
                 try:
                     bankroll  = bot.balance.cached_balance
                     open_pos  = [p for p in bot.positions.values() if p.status == "open"]
+                    def _upnl(p):
+                        if p.status == 'closed':
+                            return p.pnl
+                        price = p.current_price if p.current_price > 0 else p.entry_price
+                        return (price - p.entry_price) * p.shares
+
                     rows = "".join(
                         f"<tr>"
                         f"<td>{p.source_name}</td>"
@@ -843,7 +851,7 @@ def run_dashboard():
                         f"<td>{p.entry_price:.3f}</td>"
                         f"<td>{p.order_type}</td>"
                         f"<td>{p.status}</td>"
-                        f"<td style='color:{'#4ade80' if p.pnl>=0 else '#f87171'}'>${p.pnl:+.2f}</td>"
+                        f"<td style='color:{'#4ade80' if _upnl(p)>=0 else '#f87171'}'>${_upnl(p):+.2f}</td>"
                         f"</tr>"
                         for p in bot.positions.values()
                     )
