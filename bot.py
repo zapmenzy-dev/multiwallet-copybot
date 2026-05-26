@@ -502,9 +502,16 @@ class CopyTrader:
                     if not token_id:
                         continue
 
-                    value = float(
-                        p.get("currentValue") or p.get("value") or p.get("size") or 0
-                    )
+                    # currentValue / value = dollar value of the position
+                    # size / shares = number of shares held (never use for $ filter)
+                    value = float(p.get("currentValue") or p.get("value") or 0)
+                    shares = float(p.get("size") or p.get("shares") or 0)
+
+                    # Fall back to shares × price only if no dollar value provided
+                    if value == 0 and shares > 0:
+                        price_hint = float(p.get("price") or p.get("lastTradePrice") or 0)
+                        value = shares * price_hint
+
                     if value < MIN_SOURCE_SIZE:
                         continue
 
@@ -513,8 +520,6 @@ class CopyTrader:
                         side = raw_side
                     else:
                         side = "SELL" if value < 0 else "BUY"
-
-                    shares = float(p.get("size") or p.get("shares") or 0)
 
                     cleaned.append({
                         "asset":   token_id,
@@ -631,56 +636,75 @@ class CopyTrader:
         1. Source wallet no longer holds the token (copy-exit).
         2. Price dropped ≥ 50% below entry (hard stop-loss).
         3. Price dropped ≥ 25% below the position's peak price (trailing stop).
+
+        Fetches each source wallet ONCE per cycle (not once per position)
+        to avoid hammering the API with 54 sequential calls.
         Network errors are ignored — never close on a flaky API response.
         """
+        # ── Step 1: fetch each source wallet once ────────────────────────────
+        wallet_snapshot: dict[str, dict] = {}  # wallet_addr → {token_id: position_dict}
+        wallet_error: set[str] = set()
+
+        for wallet_addr in set(p.source_wallet for p in self.positions.values() if p.status == "open"):
+            try:
+                url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=500"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        logging.warning(f"scan_for_exits: API {r.status} for {wallet_addr[:10]}… — holding all")
+                        wallet_error.add(wallet_addr)
+                        continue
+                    data = await r.json()
+                    positions = data if isinstance(data, list) else []
+                    wallet_snapshot[wallet_addr] = {p.get("asset"): p for p in positions if p.get("asset")}
+                    logging.info(f"EXIT-SCAN fetched {len(wallet_snapshot[wallet_addr])} positions for {wallet_addr[:10]}…")
+            except Exception as e:
+                logging.warning(f"scan_for_exits fetch error ({wallet_addr[:10]}…): {e} — holding all")
+                wallet_error.add(wallet_addr)
+
+        # ── Step 2: evaluate each open position against snapshot ─────────────
         to_close: list[tuple[str, Position, float, str]] = []
 
         for pos_key, pos in list(self.positions.items()):
             if pos.status != "open":
                 continue
 
-            mid_price  = await self.get_mid_price(session, pos.token_id)
-            source_pos = await self._get_source_position(session, pos.source_wallet, pos.token_id)
+            # Skip on network error — never close on bad data
+            if pos.source_wallet in wallet_error:
+                continue
 
-            if source_pos and source_pos.get("_network_error"):
-                logging.debug(f"  EXIT-SCAN {pos.question[:40]} — network error, holding")
-                continue  # API flaky — hold position
+            snapshot = wallet_snapshot.get(pos.source_wallet, {})
+            source_raw = snapshot.get(pos.token_id)
 
-            src_val = source_pos.get("value", 0) if source_pos else 0
-            logging.debug(
-                f"  EXIT-SCAN {pos.question[:40]} | "
-                f"mid={mid_price:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
-                f"sl={pos.entry_price*(1-STOP_LOSS):.3f} "
-                f"trail={pos.peak_price*(1-TRAIL_STOP):.3f} "
-                f"source={'held $'+str(round(src_val,2)) if source_pos else 'EXITED'}"
-            )
+            # Get current mid price
+            mid_price = await self.get_mid_price(session, pos.token_id)
 
-            reason = None
-
-            # Update trailing-stop peak (only when we have a valid price)
+            # Update trailing-stop peak
             if mid_price > 0:
                 if pos.peak_price <= 0:
                     pos.peak_price = pos.entry_price
                 if mid_price > pos.peak_price:
                     pos.peak_price = mid_price
 
-            # 1. Source exited
-            if source_pos is None:
-                reason = "source_exited"
+            src_val = float(source_raw.get("currentValue") or source_raw.get("value") or 0) if source_raw else 0
+            logging.info(
+                f"  CHECK {pos.question[:45]} | "
+                f"mid={mid_price:.3f} entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
+                f"source={'$'+str(round(src_val,2)) if source_raw else 'EXITED'}"
+            )
 
-            # 2. Hard stop-loss: price ≤ 50% of entry
+            reason = None
+
+            if source_raw is None:
+                reason = "source_exited"
             elif mid_price > 0 and mid_price <= pos.entry_price * (1 - STOP_LOSS):
                 reason = f"stop_loss_50% (entry={pos.entry_price:.3f} now={mid_price:.3f})"
-
-            # 3. Trailing stop: price ≤ 75% of peak (i.e. 25% off the top)
             elif mid_price > 0 and pos.peak_price > 0 and mid_price <= pos.peak_price * (1 - TRAIL_STOP):
-                reason = (
-                    f"trail_stop_25% (peak={pos.peak_price:.3f} now={mid_price:.3f})"
-                )
+                reason = f"trail_stop_25% (peak={pos.peak_price:.3f} now={mid_price:.3f})"
 
             if reason:
                 to_close.append((pos_key, pos, mid_price or pos.entry_price, reason))
 
+        # ── Step 3: execute closes ────────────────────────────────────────────
         for pos_key, pos, exit_price, reason in to_close:
             ok, _ = await self._execute_and_refresh(
                 session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price
