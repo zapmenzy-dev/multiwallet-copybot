@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 MULTI-WALLET COPY TRADER with Real-Time WebSocket Price Updates
+Correctly handles both YES and NO market pricing
 """
 
 import os
@@ -10,7 +11,7 @@ import logging
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set, List
+from typing import Dict, Optional, Set, List, Tuple
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
@@ -77,7 +78,6 @@ last_loss_reset_date: str = ""
 
 
 def halt_bot():
-    """Emergency halt the bot when daily loss limit is hit."""
     global bot_paused_until
     bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
     logging.error(f"🚨 DAILY LOSS LIMIT HIT (${DAILY_LOSS_LIMIT}) - Bot paused until {bot_paused_until}")
@@ -85,11 +85,6 @@ def halt_bot():
 
 # ==================== REAL-TIME WEBSOCKET PRICE MANAGER ====================
 class RealTimeWebSocketManager:
-    """
-    Real-time WebSocket manager for Polymarket order book updates.
-    Provides millisecond-latency price updates for accurate PnL calculation.
-    """
-    
     def __init__(self):
         self.bid_cache: Dict[str, float] = {}
         self.ask_cache: Dict[str, float] = {}
@@ -127,39 +122,26 @@ class RealTimeWebSocketManager:
                 pass
         if self._ws:
             await self._ws.close()
-        logging.info("Real-time WebSocket price manager stopped")
-        
+            
     async def subscribe(self, token_id: str):
         if token_id in self._subscribed_tokens:
             return
-            
         self._subscribed_tokens.add(token_id)
-        
         if self._ws and not self._ws.closed:
             try:
-                sub_msg = json.dumps({
-                    "type": "subscribe",
-                    "channel": "level2",
-                    "token_id": token_id
-                })
+                sub_msg = json.dumps({"type": "subscribe", "channel": "level2", "token_id": token_id})
                 await self._ws.send_str(sub_msg)
-                logging.info(f"📡 Subscribed to real-time order book for {token_id[:12]}...")
+                logging.info(f"📡 Subscribed to {token_id[:12]}...")
             except Exception as e:
-                logging.warning(f"Failed to subscribe to {token_id[:12]}: {e}")
+                logging.warning(f"Failed to subscribe: {e}")
                 
     async def unsubscribe(self, token_id: str):
         if token_id not in self._subscribed_tokens:
             return
-            
         self._subscribed_tokens.discard(token_id)
-        
         if self._ws and not self._ws.closed:
             try:
-                unsub_msg = json.dumps({
-                    "type": "unsubscribe",
-                    "channel": "level2",
-                    "token_id": token_id
-                })
+                unsub_msg = json.dumps({"type": "unsubscribe", "channel": "level2", "token_id": token_id})
                 await self._ws.send_str(unsub_msg)
             except Exception:
                 pass
@@ -185,14 +167,9 @@ class RealTimeWebSocketManager:
     async def _connect(self):
         ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws"
         self._ws = await self._session.ws_connect(ws_url)
-        logging.info("🔌 Real-time WebSocket connected to Polymarket")
-        
+        logging.info("🔌 WebSocket connected")
         for token_id in self._subscribed_tokens:
-            sub_msg = json.dumps({
-                "type": "subscribe",
-                "channel": "level2",
-                "token_id": token_id
-            })
+            sub_msg = json.dumps({"type": "subscribe", "channel": "level2", "token_id": token_id})
             await self._ws.send_str(sub_msg)
             
     async def _listen(self):
@@ -203,22 +180,17 @@ class RealTimeWebSocketManager:
                     await self._handle_message(data)
                 except json.JSONDecodeError:
                     pass
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                break
-            elif msg.type == aiohttp.WSMsgType.CLOSED:
+            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                 break
                 
     async def _handle_message(self, data: dict):
         event_type = data.get("event_type")
-        
         if event_type == "book":
             token_id = data.get("asset_id")
             bids = data.get("bids", [])
             asks = data.get("asks", [])
-            
             if token_id:
                 self.full_orderbook[token_id] = {"bids": bids, "asks": asks}
-                
                 if bids:
                     self.bid_cache[token_id] = float(bids[0].get("price", 0))
                 if asks:
@@ -229,21 +201,20 @@ class RealTimeWebSocketManager:
                     self.mid_cache[token_id] = self.bid_cache[token_id]
                 elif asks:
                     self.mid_cache[token_id] = self.ask_cache[token_id]
-                    
                 if token_id in self._price_callbacks:
                     for callback in self._price_callbacks[token_id]:
                         try:
                             await callback(token_id, self.get_best_bid(token_id), self.get_best_ask(token_id))
                         except Exception as e:
-                            logging.error(f"Callback error for {token_id[:12]}: {e}")
+                            logging.error(f"Callback error: {e}")
 
 
-# ==================== DATA CLASS with WAP Tracking ====================
+# ==================== DATA CLASS ====================
 @dataclass
 class Position:
     market_id: str
     question: str
-    outcome: str
+    outcome: str  # "YES" or "NO"
     token_id: str
     side: str
     entry_price: float
@@ -274,53 +245,39 @@ class Position:
         self.shares = self.total_shares_filled
         self.size_usd = self.total_cost_usd
         self.entry_price = self.total_cost_usd / self.total_shares_filled if self.total_shares_filled > 0 else 0
-        
-        self.fill_history.append({
-            "shares": new_shares,
-            "price": new_price,
-            "cost": new_cost,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        logging.info(f"📊 WAP Updated: {self.question[:35]} | New WAP: ${self.entry_price:.4f}")
+        self.fill_history.append({"shares": new_shares, "price": new_price, "cost": new_cost, "timestamp": datetime.now().isoformat()})
 
     def update_realized_pnl(self, exit_shares: float, exit_price: float):
         if exit_shares > self.shares:
             exit_shares = self.shares
-            
         cost_basis = exit_shares * self.entry_price
         proceeds = exit_shares * exit_price
         realized = proceeds - cost_basis
-        
         self.realized_pnl += realized
         self.shares -= exit_shares
         self.size_usd -= cost_basis
         self.total_shares_filled -= exit_shares
         self.total_cost_usd -= cost_basis
-        
         if self.shares > 0:
             self.entry_price = self.total_cost_usd / self.total_shares_filled
-        
         return realized
 
     def calculate_unrealized_pnl(self, current_best_bid: float, current_best_ask: float) -> float:
         if self.status != "open" or self.shares <= 0:
             return self.unrealized_pnl
-            
+        # For LONG positions (BUY), we exit at the bid price
+        # For SHORT positions (SELL), we exit at the ask price
         if self.side == "BUY":
             exit_price = current_best_bid if current_best_bid > 0 else self.current_price
         else:
             exit_price = current_best_ask if current_best_ask > 0 else self.current_price
-            
         if exit_price <= 0:
             return self.unrealized_pnl
-            
         self.unrealized_pnl = (exit_price - self.entry_price) * self.shares
         self.current_price = exit_price
         self.current_best_bid = current_best_bid
         self.current_best_ask = current_best_ask
         self.last_update_time = datetime.now()
-        
         return self.unrealized_pnl
 
     def total_pnl(self) -> float:
@@ -352,20 +309,15 @@ class RobustBalanceManager:
 
     def _call_payload(self, contract: str, wallet: str) -> dict:
         padded = wallet.lower().replace("0x", "").zfill(64)
-        return {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [{"to": contract, "data": BALANCE_OF_SELECTOR + padded}, "latest"],
-        }
+        return {"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": contract, "data": BALANCE_OF_SELECTOR + padded}, "latest"]}
 
     async def _query_contract(self, session, rpc_url, label, contract, decimals, wallet):
         try:
             payload = self._call_payload(contract, wallet)
             async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                text = await resp.text()
                 if resp.status != 200:
                     return None
+                text = await resp.text()
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
@@ -382,7 +334,6 @@ class RobustBalanceManager:
     async def _fetch_rpc(self, session, wallet):
         for rpc_url in POLYGON_RPCS:
             total = 0.0
-            breakdown = {}
             rpc_alive = False
             for label, contract, decimals in PUSD_CONTRACTS:
                 amount = await self._query_contract(session, rpc_url, label, contract, decimals, wallet)
@@ -390,10 +341,8 @@ class RobustBalanceManager:
                     continue
                 rpc_alive = True
                 if amount > 0:
-                    breakdown[label] = amount
                     total += amount
             if rpc_alive:
-                self._breakdown = breakdown
                 return total
         return None
 
@@ -430,9 +379,9 @@ class PolymarketExecutor:
             from py_clob_client.clob_types import ApiCreds
             creds = ApiCreds(api_key=CLOB_API_KEY, api_secret=CLOB_SECRET, api_passphrase=CLOB_PASSPHRASE)
             self._client = ClobClient(host="https://clob.polymarket.com", key=YOUR_PRIVATE_KEY, chain_id=137, creds=creds)
-            logging.info("CLOB client initialised (LIVE mode)")
+            logging.info("CLOB client initialised")
         except ImportError:
-            logging.error("py-clob-client not installed. Run: pip install py-clob-client")
+            logging.error("py-clob-client not installed")
             raise
 
     async def place_limit_buy(self, token_id: str, amount_usd: float, best_ask: float):
@@ -494,7 +443,7 @@ class CopyTrader:
                 old_pnl = pos.unrealized_pnl
                 new_pnl = pos.calculate_unrealized_pnl(best_bid, best_ask)
                 if abs(new_pnl - old_pnl) > 0.01:
-                    logging.debug(f"⚡ Real-time PnL | {pos.question[:30]} | ${new_pnl:+.2f}")
+                    logging.debug(f"⚡ PnL | {pos.question[:30]} | ${new_pnl:+.2f}")
                 await self._check_risk_conditions(pos, best_bid, best_ask)
 
     async def _check_risk_conditions(self, pos: Position, best_bid: float, best_ask: float):
@@ -538,12 +487,11 @@ class CopyTrader:
     def total_pnl(self) -> float:
         return self.total_unrealized_pnl() + self.total_realized_pnl()
 
-    def _trade_size(self, bankroll: float, wallet_addr: str, mid_price: float) -> float:
-        """Compute trade size - scaled down for testing NO positions"""
+    def _trade_size(self, bankroll: float, wallet_addr: str, market_price: float) -> float:
         config = WALLETS[wallet_addr]
         risk_type = config.get("risk_type", "fixed")
         if risk_type == "price_based":
-            fraction = max(0.05, min(mid_price, 1.0)) * MAX_TRADE_FRAC
+            fraction = max(0.05, min(market_price, 1.0)) * MAX_TRADE_FRAC
         else:
             fraction = config.get("fixed_risk", MAX_TRADE_FRAC)
         fraction = max(MIN_TRADE_FRAC, min(fraction, MAX_TRADE_FRAC))
@@ -562,12 +510,32 @@ class CopyTrader:
         drawdown = (peak_bankroll - bankroll) / peak_bankroll
         if drawdown >= MAX_DRAWDOWN:
             bot_paused_until = datetime.now() + timedelta(hours=PAUSE_HOURS)
-            logging.warning(f"Drawdown {drawdown:.1%} ≥ {MAX_DRAWDOWN:.1%} — pausing")
+            logging.warning(f"Drawdown {drawdown:.1%} ≥ {MAX_DRAWDOWN:.1%} - pausing")
             return True
         return False
 
-    # ========== FIXED: get_positions with correct NO token pricing ==========
+    async def get_orderbook(self, session: aiohttp.ClientSession, token_id: str) -> Tuple[float, float]:
+        try:
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    bb = float(bids[0]["price"]) if bids else 0.0
+                    ba = float(asks[0]["price"]) if asks else 0.0
+                    return bb, ba
+        except Exception as e:
+            logging.warning(f"get_orderbook error: {e}")
+        return 0.0, 0.0
+
+    # ========== CORRECT PRICE HANDLING FOR YES/NO MARKETS ==========
     async def get_positions(self, session: aiohttp.ClientSession, wallet_addr: str):
+        """
+        Fetch positions from source wallet.
+        The API returns the actual token_id for the position (YES or NO token).
+        We use that token_id directly to get the CORRECT market price.
+        """
         try:
             url = f"https://data-api.polymarket.com/positions?user={wallet_addr}&limit=100"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
@@ -588,31 +556,35 @@ class CopyTrader:
                     title = p.get("title", "Unknown Market")
                     outcome = p.get("outcome", "")
                     
-                    # Get the current market price for THIS token (YES or NO)
+                    # IMPORTANT: The token_id is the ACTUAL token for this outcome
+                    # If outcome is "NO", token_id is the NO token
+                    # If outcome is "YES", token_id is the YES token
+                    # So we fetch the order book for THIS token_id to get the correct price
                     best_bid, best_ask = await self.get_orderbook(session, token_id)
                     current_price = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
                     
-                    # If we couldn't get price from orderbook, try to estimate from value/shares
-                    if current_price <= 0 and shares > 0:
-                        current_price = value / shares if value > 0 else 0
+                    # Fallback: estimate from value/shares
+                    if current_price <= 0 and shares > 0 and value > 0:
+                        current_price = value / shares
                     
-                    # Calculate value if not provided
+                    # Calculate value if missing
                     if value == 0 and shares > 0 and current_price > 0:
                         value = shares * current_price
                     
-                    # Determine side
+                    # Determine side (BUY means they hold the token)
                     raw_side = (p.get("side") or "").upper()
                     if raw_side in ("BUY", "SELL"):
                         side = raw_side
                     else:
                         side = "BUY" if value > 0 else "SELL"
                     
-                    # Skip if below minimum size
+                    # Skip small positions
                     if abs(value) < MIN_SOURCE_SIZE:
                         continue
                     
                     # Log for debugging
-                    logging.info(f"📊 SOURCE: {title[:40]} | outcome={outcome} | side={side} | value=${abs(value):.2f} | shares={shares:.4f} | price={current_price:.4f}")
+                    outcome_display = "YES" if outcome.upper() == "YES" else "NO"
+                    logging.info(f"📊 SOURCE: {title[:45]} | {outcome_display} token | price=${current_price:.4f} | value=${abs(value):.2f} | shares={shares:.4f}")
                     
                     cleaned.append({
                         "asset": token_id,
@@ -621,27 +593,12 @@ class CopyTrader:
                         "side": side,
                         "value": abs(value),
                         "shares": abs(shares),
-                        "price": current_price,  # Store the correct market price for this token
+                        "price": current_price,  # This is the CORRECT price for this outcome's token
                     })
                 return cleaned
         except Exception as e:
-            logging.error(f"Fetch positions error ({wallet_addr[:10]}…): {e}")
+            logging.error(f"Fetch positions error: {e}")
             return None
-
-    async def get_orderbook(self, session: aiohttp.ClientSession, token_id: str) -> tuple:
-        try:
-            url = f"https://clob.polymarket.com/book?token_id={token_id}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    bids = data.get("bids", [])
-                    asks = data.get("asks", [])
-                    bb = float(bids[0]["price"]) if bids else 0.0
-                    ba = float(asks[0]["price"]) if asks else 0.0
-                    return bb, ba
-        except Exception as e:
-            logging.warning(f"get_orderbook error: {e}")
-        return 0.0, 0.0
 
     async def _get_source_position(self, session, wallet_addr, token_id):
         try:
@@ -709,6 +666,7 @@ class CopyTrader:
                     wallet_snapshot[wallet_addr] = {p.get("asset"): p for p in positions if p.get("asset")}
             except Exception:
                 wallet_error.add(wallet_addr)
+        
         to_close = []
         for pos_key, pos in list(self.positions.items()):
             if pos.status != "open":
@@ -718,26 +676,32 @@ class CopyTrader:
                 continue
             if pos.source_wallet in wallet_error:
                 continue
+            
             snapshot = wallet_snapshot.get(pos.source_wallet, {})
             source_raw = snapshot.get(pos.token_id)
+            
             current_bid = self.ws_manager.get_best_bid(pos.token_id)
             if current_bid <= 0:
                 current_bid, _ = await self.get_orderbook(session, pos.token_id)
+            
             if current_bid > 0:
                 pos.current_best_bid = current_bid
                 pos.current_price = current_bid
                 if current_bid > pos.peak_price:
                     pos.peak_price = current_bid
                 pos.calculate_unrealized_pnl(current_bid, self.ws_manager.get_best_ask(pos.token_id))
+            
             reason = None
             if source_raw is None:
                 reason = "source_exited"
             elif current_bid > 0 and current_bid <= pos.entry_price * (1 - STOP_LOSS):
-                reason = f"stop_loss_50%"
+                reason = "stop_loss_50%"
             elif current_bid > 0 and pos.peak_price > 0 and current_bid <= pos.peak_price * (1 - TRAIL_STOP):
-                reason = f"trail_stop_25%"
+                reason = "trail_stop_25%"
+            
             if reason:
                 to_close.append((pos_key, pos, current_bid or pos.entry_price, reason))
+        
         for pos_key, pos, exit_price, reason in to_close:
             ok, _, exec_price = await self._execute_and_refresh(session, "SELL", pos.token_id, pos.shares, pos.size_usd, exit_price)
             if ok:
@@ -755,57 +719,76 @@ class CopyTrader:
             remaining = bot_paused_until - datetime.now()
             logging.info(f"Bot paused — {remaining} remaining")
             return
+        
         async with aiohttp.ClientSession() as session:
             if not self.ws_manager._running:
                 await self.ws_manager.start(session)
+            
             bankroll = await self.balance.get(session, force=True)
             if bankroll < 1.0:
                 logging.warning(f"Bankroll too low (${bankroll:.4f})")
                 return
+            
             if bankroll > peak_bankroll:
                 peak_bankroll = bankroll
+            
             if self._check_drawdown(bankroll):
                 return
+            
             open_count = sum(1 for p in self.positions.values() if p.status == "open")
             logging.info(f"Scanning | bankroll=${bankroll:.2f} | open={open_count} | exposure=${self._total_exposure():.2f}")
+            
             await self.update_positions_pnl_realtime()
             await self.scan_for_exits(session)
+            
             for wallet_addr, config in WALLETS.items():
                 raw = await self.get_positions(session, wallet_addr)
                 if not raw:
                     continue
+                
                 for pos in raw:
                     token_id = pos["asset"]
                     question = pos["title"]
                     outcome = pos["outcome"]
                     side = pos["side"]
                     pos_key = f"{wallet_addr}_{token_id}_{side}"
+                    
                     if pos_key in self.positions:
                         continue
+                    
                     if pos["value"] < MIN_SOURCE_SIZE:
                         continue
-                    # Use the CORRECT price for this token (already fetched from its own order book)
+                    
+                    # Use the CORRECT market price for this token (YES or NO)
                     market_price = pos["price"]
+                    
                     if market_price <= 0.01:
+                        # Fallback: fetch fresh orderbook
                         best_bid, best_ask = await self.get_orderbook(session, token_id)
                         market_price = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
+                    
                     if market_price <= 0.01:
-                        logging.debug(f"Skipping {token_id[:12]}… — no price")
+                        logging.debug(f"Skipping {token_id[:12]}… - no price")
                         continue
+                    
                     # Calculate trade size based on the actual market price
                     my_size = self._trade_size(bankroll, wallet_addr, market_price)
                     if my_size <= 0:
                         continue
+                    
                     shares = round(my_size / market_price, 4)
                     best_bid, best_ask = await self.get_orderbook(session, token_id)
+                    
                     ok, order_id, exec_price = await self._execute_and_refresh(
                         session, side, token_id, shares, my_size, market_price, best_ask=best_ask
                     )
+                    
                     if ok:
+                        outcome_display = "YES" if outcome.upper() == "YES" else "NO"
                         new_position = Position(
                             market_id="",
                             question=question,
-                            outcome=outcome,
+                            outcome=outcome_display,
                             side=side,
                             token_id=token_id,
                             entry_price=exec_price,
@@ -824,11 +807,12 @@ class CopyTrader:
                         self.positions[pos_key] = new_position
                         await self.ws_manager.subscribe(token_id)
                         self.ws_manager.register_callback(token_id, self.on_price_update)
-                        logging.info(f"✅ COPIED [{config['name']}] {side} ${my_size:.2f} @ {exec_price:.4f} ({shares:.4f} shares) → {question[:40]} | outcome={outcome}")
+                        logging.info(f"✅ COPIED [{config['name']}] {side} ${my_size:.2f} @ {exec_price:.4f} ({shares:.4f} shares) → {question[:45]} | {outcome_display} token")
 
     async def run(self):
         logging.info(f"🚀 Bot started | dry_run={self.dry_run} | wallets={len(WALLETS)}")
-        logging.info(f"🔌 Using REAL-TIME WebSocket with CORRECT NO token pricing")
+        logging.info(f"🔌 Using REAL-TIME WebSocket with CORRECT YES/NO token pricing")
+        logging.info(f"📐 For each position, using the actual token's order book price")
         try:
             while True:
                 try:
@@ -855,7 +839,6 @@ def run_dashboard():
                     total_pnl = bot.total_pnl()
                     total_open_pnl = bot.total_unrealized_pnl()
                     total_closed_pnl = bot.total_realized_pnl()
-                    wallet_stats = bot.get_wallet_stats()
                     
                     def fmt_pnl(pnl):
                         return f"${pnl:+.2f}"
@@ -863,29 +846,33 @@ def run_dashboard():
                     open_rows = ""
                     for p in open_positions:
                         pnl_color = "#4ade80" if p.unrealized_pnl >= 0 else "#f87171"
+                        side_color = "#4ade80" if p.side == "BUY" else "#f87171"
+                        outcome_color = "#4ade80" if p.outcome == "YES" else "#f87171"
                         current_display = f"{p.current_best_bid:.4f}" if p.current_best_bid > 0 else f"{p.current_price:.4f}"
                         open_rows += f"""
                         <tr>
                             <td style="font-family:monospace">{p.source_name}</td>
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:50]}</td>
-                            <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171}'">{p.side}</td>
-                            <td style="font-family:monospace">{p.outcome}</td>
-                            <td style="font-family:monospace">${p.size_usd:.2f}<br><span style="font-size:10px;color:#888">{p.shares:.4f} sh</span></td>
+                            <td style="color: {side_color}">{p.side}</td>
+                            <td style="color: {outcome_color}; font-weight:bold">{p.outcome}</td>
+                            <td style="font-family:monospace">${p.size_usd:.2f}<br/><span style="font-size:10px;color:#888">{p.shares:.4f} sh</span></td>
                             <td style="font-family:monospace">{p.entry_price:.4f}</td>
                             <td style="font-family:monospace">{current_display}</td>
-                            <td style="color: {pnl_color}; font-weight: bold;">{fmt_pnl(p.unrealized_pnl)}<br><span style="font-size:10px">{p.pnl_pct():+.1f}%</span></td>
+                            <td style="color: {pnl_color}; font-weight: bold;">{fmt_pnl(p.unrealized_pnl)}<br/><span style="font-size:10px">{p.pnl_pct():+.1f}%</span></td>
                         </tr>
                         """
                     
                     closed_rows = ""
                     for p in closed_positions:
                         pnl_color = "#4ade80" if p.pnl >= 0 else "#f87171"
+                        side_color = "#4ade80" if p.side == "BUY" else "#f87171"
+                        outcome_color = "#4ade80" if p.outcome == "YES" else "#f87171"
                         closed_rows += f"""
                         <tr>
                             <td style="font-family:monospace">{p.source_name}</td>
                             <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:50]}</td>
-                            <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171}'">{p.side}</td>
-                            <td style="font-family:monospace">{p.outcome}</td>
+                            <td style="color: {side_color}">{p.side}</td>
+                            <td style="color: {outcome_color}; font-weight:bold">{p.outcome}</td>
                             <td style="font-family:monospace">${p.size_usd:.2f}</td>
                             <td style="font-family:monospace">{p.entry_price:.4f}</td>
                             <td style="font-family:monospace">{p.exit_price:.4f}</td>
@@ -893,40 +880,63 @@ def run_dashboard():
                         </tr>
                         """
                     
-                    pause_str = "Active" if not (bot_paused_until and datetime.now() < bot_paused_until) else f"Paused until {bot_paused_until.strftime('%H:%M')}"
+                    pause_str = "Active" if not (bot_paused_until and datetime.now() < bot_paused_until) else f"Paused"
                     drawdown_pct = ((peak_bankroll - bankroll) / peak_bankroll * 100) if peak_bankroll > 0 else 0
                     
                     html = f"""<!DOCTYPE html>
-                    <html><head><meta charset="utf-8"><title>CopyTrader</title><meta http-equiv="refresh" content="30">
-                    <style>body{{font-family:monospace;padding:20px;background:#0a0a0a;color:#e0e0e0;}}
-                    .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:30px;}}
-                    .stat-card{{background:#1a1a1a;padding:15px;border-radius:8px;}}
-                    .stat-label{{font-size:11px;color:#888;}}
-                    .stat-value{{font-size:24px;font-weight:bold;}}
-                    .positive{{color:#4ade80;}}.negative{{color:#f87171;}}
-                    table{{width:100%;border-collapse:collapse;}}
-                    th,td{{border:1px solid #333;padding:8px;text-align:left;}}
-                    th{{background:#1a1a1a;}}</style>
-                    </head><body>
-                    <h2>📊 CopyTrader <span style="background:#dc2626;padding:2px 8px;border-radius:4px;font-size:12px;">WebSocket + NO Token Fix</span></h2>
-                    <div class="stats">
-                        <div class="stat-card"><div class="stat-label">Mode</div><div class="stat-value">{'LIVE' if not bot.dry_run else 'DRY'}</div></div>
-                        <div class="stat-card"><div class="stat-label">Status</div><div class="stat-value">{pause_str}</div></div>
-                        <div class="stat-card"><div class="stat-label">Bankroll</div><div class="stat-value">${bankroll:.2f}</div></div>
-                        <div class="stat-card"><div class="stat-label">Drawdown</div><div class="stat-value">{drawdown_pct:.1f}%</div></div>
-                        <div class="stat-card"><div class="stat-label">Open</div><div class="stat-value">{len(open_positions)}</div></div>
-                        <div class="stat-card"><div class="stat-label">Total PnL</div><div class="stat-value {'positive' if total_pnl>=0 else 'negative'}">{fmt_pnl(total_pnl)}</div></div>
-                    </div>
-                    <h3>📈 Open Positions</h3>
-                    <div style="overflow-x:auto;"><table><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Best Bid</th><th>PnL</th></tr>{open_rows if open_rows else '<tr><td colspan=8>None</td></tr>'}</table></div>
-                    <h3>📉 Closed</h3>
-                    <div style="overflow-x:auto;"><tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>{closed_rows if closed_rows else '<tr><td colspan=8>None</td></tr>'}</table></div>
-                    <p>📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                    </body></html>"""
+                    <html>
+                    <head>
+                        <meta charset="utf-8">
+                        <title>CopyTrader - YES/NO Price Fix</title>
+                        <meta http-equiv="refresh" content="30">
+                        <style>
+                            body{{font-family:monospace;padding:20px;background:#0a0a0a;color:#e0e0e0;}}
+                            .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:30px;}}
+                            .stat-card{{background:#1a1a1a;padding:15px;border-radius:8px;}}
+                            .stat-label{{font-size:11px;color:#888;}}
+                            .stat-value{{font-size:24px;font-weight:bold;}}
+                            .positive{{color:#4ade80;}}
+                            .negative{{color:#f87171;}}
+                            table{{width:100%;border-collapse:collapse;}}
+                            th,td{{border:1px solid #333;padding:8px;text-align:left;}}
+                            th{{background:#1a1a1a;}}
+                            .yes-badge{{color:#4ade80;}}
+                            .no-badge{{color:#f87171;}}
+                        </style>
+                    </head>
+                    <body>
+                        <h2>📊 CopyTrader <span style="background:#059669;padding:2px 8px;border-radius:4px;font-size:12px;">YES/NO Token Fix</span></h2>
+                        <div class="stats">
+                            <div class="stat-card"><div class="stat-label">Mode</div><div class="stat-value">{'LIVE' if not bot.dry_run else 'DRY'}</div></div>
+                            <div class="stat-card"><div class="stat-label">Status</div><div class="stat-value">{pause_str}</div></div>
+                            <div class="stat-card"><div class="stat-label">Bankroll</div><div class="stat-value">${bankroll:.2f}</div></div>
+                            <div class="stat-card"><div class="stat-label">Drawdown</div><div class="stat-value">{drawdown_pct:.1f}%</div></div>
+                            <div class="stat-card"><div class="stat-label">Open</div><div class="stat-value">{len(open_positions)}</div></div>
+                            <div class="stat-card"><div class="stat-label">Total PnL</div><div class="stat-value {'positive' if total_pnl>=0 else 'negative'}">{fmt_pnl(total_pnl)}</div></div>
+                        </div>
+                        <h3>📈 Open Positions <span style="font-size:12px;color:#888">(using correct token prices)</span></h3>
+                        <div style="overflow-x:auto;">
+                        <table>
+                            <tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Best Bid</th><th>PnL</th></tr>
+                            {open_rows if open_rows else '<tr><td colspan="8">None</td></tr>'}
+                        </table>
+                        </div>
+                        <h3>📉 Closed Positions</h3>
+                        <div style="overflow-x:auto;">
+                        <table>
+                            <tr><th>Source</th><th>Market</th><th>Side</th><th>Outcome</th><th>Size</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>
+                            {closed_rows if closed_rows else '<tr><td colspan="8">None</td></tr>'}
+                        </table>
+                        </div>
+                        <p>📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                        <p style="font-size:11px;color:#666;">✅ Each position uses its own token's order book price (YES token or NO token separately)</p>
+                    </body>
+                    </html>"""
                     self.wfile.write(html.encode())
                 except Exception as e:
                     self.wfile.write(f"Error: {e}".encode())
-        def log_message(self, format, *args): pass
+        def log_message(self, format, *args):
+            pass
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
     logging.info(f"Dashboard on http://0.0.0.0:{HEALTH_PORT}")
     server.serve_forever()
