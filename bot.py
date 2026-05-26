@@ -45,7 +45,9 @@ BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
 MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "8"))
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "40"))
 MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))   # 20%
-MAX_EXPOSURE       = 0.95                                       # 95% max total exposure
+MAX_EXPOSURE       = 0.90                                       # 90% max total exposure
+STOP_LOSS          = 0.50                                       # close if price drops 50% below entry
+TRAIL_STOP         = 0.25                                       # close if price drops 25% below peak
 MAX_PER_TRADE      = 0.03                                       # 3% per trade
 MIN_TRADE_FRAC     = 0.006                                      # 0.6% of bankroll floor per trade
 MAX_TRADE_FRAC     = 0.03                                       # 3% of bankroll ceiling per trade
@@ -94,6 +96,7 @@ class Position:
     exit_price: float = 0.0
     pnl: float = 0.0
     opened_at: datetime = field(default_factory=datetime.now)
+    peak_price: float = 0.0                # highest mid-price seen since entry (for trailing stop)
 
 
 # ==================== BALANCE MANAGER ====================
@@ -595,10 +598,11 @@ class CopyTrader:
 
     async def scan_for_exits(self, session: aiohttp.ClientSession):
         """
-        For each open position:
-        1. Source exited → limit sell to close.
-        2. Source flipped side → close our position.
-        3. Take-profit at 2× entry; stop-loss below 0.10.
+        Close a position when ANY of these conditions are met:
+        1. Source wallet no longer holds the token (copy-exit).
+        2. Price dropped ≥ 50% below entry (hard stop-loss).
+        3. Price dropped ≥ 25% below the position's peak price (trailing stop).
+        Network errors are ignored — never close on a flaky API response.
         """
         to_close: list[tuple[str, Position, float, str]] = []
 
@@ -609,18 +613,31 @@ class CopyTrader:
             mid_price  = await self.get_mid_price(session, pos.token_id)
             source_pos = await self._get_source_position(session, pos.source_wallet, pos.token_id)
 
+            if source_pos and source_pos.get("_network_error"):
+                continue  # API flaky — hold position
+
             reason = None
 
-            if source_pos and source_pos.get("_network_error"):
-                pass
-            elif source_pos is None:
+            # Update trailing-stop peak (only when we have a valid price)
+            if mid_price > 0:
+                if pos.peak_price <= 0:
+                    pos.peak_price = pos.entry_price
+                if mid_price > pos.peak_price:
+                    pos.peak_price = mid_price
+
+            # 1. Source exited
+            if source_pos is None:
                 reason = "source_exited"
-            elif source_pos["side"] != pos.side:
-                reason = f"source_flipped ({pos.side}→{source_pos['side']})"
-            elif mid_price > 0 and mid_price >= pos.entry_price * 2.0:
-                reason = f"take_profit (2× @ {mid_price:.3f})"
-            elif mid_price > 0 and mid_price < 0.10:
-                reason = f"stop_loss (price={mid_price:.3f})"
+
+            # 2. Hard stop-loss: price ≤ 50% of entry
+            elif mid_price > 0 and mid_price <= pos.entry_price * (1 - STOP_LOSS):
+                reason = f"stop_loss_50% (entry={pos.entry_price:.3f} now={mid_price:.3f})"
+
+            # 3. Trailing stop: price ≤ 75% of peak (i.e. 25% off the top)
+            elif mid_price > 0 and pos.peak_price > 0 and mid_price <= pos.peak_price * (1 - TRAIL_STOP):
+                reason = (
+                    f"trail_stop_25% (peak={pos.peak_price:.3f} now={mid_price:.3f})"
+                )
 
             if reason:
                 to_close.append((pos_key, pos, mid_price or pos.entry_price, reason))
@@ -635,7 +652,7 @@ class CopyTrader:
                 pos.pnl        = (exit_price - pos.entry_price) * pos.shares
                 logging.info(
                     f"CLOSED [{reason}] {pos.question[:50]} | "
-                    f"side={pos.side} entry={pos.entry_price:.3f} "
+                    f"entry={pos.entry_price:.3f} peak={pos.peak_price:.3f} "
                     f"exit={pos.exit_price:.3f} pnl=${pos.pnl:+.2f}"
                 )
                 del self.positions[pos_key]
@@ -730,6 +747,7 @@ class CopyTrader:
                             source_wallet= wallet_addr,
                             source_name  = config["name"],
                             order_type   = "LIMIT",
+                            peak_price   = mid_price,
                         )
                         logging.info(
                             f"COPIED [{config['name']}] LIMIT {side} ${my_size:.2f} "
