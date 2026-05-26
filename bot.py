@@ -42,7 +42,7 @@ CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
 BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
 
-MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "8"))
+MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))  # no hard limit
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "40"))
 MAX_DRAWDOWN       = float(os.getenv("MAX_DRAWDOWN", "0.20"))   # 20%
 MAX_EXPOSURE       = 0.80                                       # 80% max total exposure
@@ -743,11 +743,6 @@ class CopyTrader:
 
                     if pos["value"] < MIN_SOURCE_SIZE:
                         continue
-
-                    open_count = sum(1 for p in self.positions.values() if p.status == "open")
-                    if open_count >= MAX_POSITIONS:
-                        logging.info("Max positions reached — skipping remaining")
-                        break
 
                     best_bid, best_ask = await self.get_orderbook(session, token_id)
                     mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else best_bid or best_ask
