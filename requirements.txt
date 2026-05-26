@@ -1,7 +1,5 @@
-asyncio
-httpx
 web3>=6.0.0
 python-dotenv
-aiohttp
+requests
 py_clob_client
 py_builder_relayer_client
