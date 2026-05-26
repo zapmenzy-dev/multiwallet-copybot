@@ -1,4 +1,6 @@
-aiohttp
-requests
+web3
+httpx
+asyncio
 python-dotenv
-py-clob-client
+aiohttp
+loguru           # optional, nicer logging
