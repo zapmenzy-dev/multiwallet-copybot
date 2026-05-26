@@ -3,3 +3,4 @@ httpx
 web3>=6.0.0
 python-dotenv
 aiohttp
+py_clob_client
