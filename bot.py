@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MULTI-WALLET POLYMARKET COPY TRADER - Improved Version
+MULTI-WALLET POLYMARKET COPY TRADER - Fixed for Render
 """
 
 import os
@@ -11,6 +11,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
+from dataclasses import dataclass, field   # ← FIXED: Added this import
 
 import aiohttp
 from dotenv import load_dotenv
@@ -31,7 +32,7 @@ CLOB_API_KEY     = os.getenv("POLY_API_KEY", "")
 CLOB_SECRET      = os.getenv("POLY_SECRET", "")
 CLOB_PASSPHRASE  = os.getenv("POLY_PASSPHRASE", "")
 
-BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0"))
+BANKROLL_FALLBACK = float(os.getenv("BANKROLL", "0.0"))
 
 MAX_POSITIONS      = int(os.getenv("MAX_POSITIONS", "9999"))
 POLL_INTERVAL      = int(os.getenv("POLL_SECONDS", "60"))
@@ -58,9 +59,8 @@ PUSD_CONTRACTS = [
     ("NegRisk-v2","0xe2222d279d744050d28e00520010520000310F59", 6),
 ]
 
-_LOG_LEVEL = logging.DEBUG if os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
 logging.basicConfig(
-    level=_LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -115,7 +115,7 @@ class RobustBalanceManager:
                     breakdown[label] = amount
                     total += amount
 
-            if breakdown or total == 0:  # RPC responded
+            if breakdown or total == 0:
                 self._breakdown = breakdown
                 self._last_source = "RPC"
                 logging.info(f"Balance → ${total:.4f} via RPC")
@@ -130,7 +130,7 @@ class RobustBalanceManager:
                     return None
                 data = await resp.json(content_type=None)
                 value = float(data) if isinstance(data, (int, float)) else float(
-                    data.get("portfolioValue") or data.get("value") or 0)
+                    data.get("portfolioValue") or data.get("value") or data.get("balance") or 0)
                 if value >= 0:
                     self._last_source = "Polymarket API"
                     logging.info(f"Balance → ${value:.4f} via API")
@@ -179,10 +179,7 @@ class Position:
     current_price: float = 0.0
 
 
-# ==================== EXECUTOR & COPY TRADER (Simplified) ====================
-# Note: Add your full PolymarketExecutor here if needed.
-# For now, using minimal version for deployment test.
-
+# ==================== COPY TRADER (Minimal for deployment) ====================
 class CopyTrader:
     def __init__(self, dry_run: bool = True):
         self.dry_run = dry_run
@@ -192,7 +189,7 @@ class CopyTrader:
         self.bot_paused_until: Optional[datetime] = None
 
     async def run(self):
-        logging.info(f"CopyTrader started | Dry-run: {self.dry_run}")
+        logging.info(f"✅ CopyTrader started | Dry-run: {self.dry_run} | PORT: {HEALTH_PORT}")
         while True:
             try:
                 await self.scan_and_copy()
@@ -201,12 +198,11 @@ class CopyTrader:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def scan_and_copy(self):
-        # Basic placeholder - expand as needed
         async with aiohttp.ClientSession() as session:
             bankroll = await self.balance.get(session, force=True)
             if bankroll > self.peak_bankroll:
                 self.peak_bankroll = bankroll
-            logging.info(f"Bankroll: ${bankroll:.2f} | Peak: ${self.peak_bankroll:.2f}")
+            logging.info(f"Bankroll: ${bankroll:.2f} | Peak: ${self.peak_bankroll:.2f} | Positions: {len(self.positions)}")
 
 
 # ==================== DASHBOARD ====================
@@ -223,26 +219,31 @@ def run_dashboard(bot: CopyTrader):
                     "bankroll": round(bot.balance.cached_balance, 4),
                     "peak_bankroll": round(bot.peak_bankroll, 4),
                     "open_positions": len(bot.positions),
+                    "port": HEALTH_PORT
                 }
                 self.wfile.write(json.dumps(data, indent=2).encode())
                 return
 
+            # Simple HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            html = f"""<h1>CopyTrader Dashboard</h1>
-            <p>Status: Running</p>
-            <p>Bankroll: ${bot.balance.cached_balance:.4f}</p>
-            <p>Peak: ${bot.peak_bankroll:.4f}</p>
+            html = f"""
+            <h1>Polymarket CopyTrader</h1>
+            <p><strong>Status:</strong> Running</p>
+            <p><strong>Mode:</strong> {'DRY RUN' if bot.dry_run else 'LIVE'}</p>
+            <p><strong>Bankroll:</strong> ${bot.balance.cached_balance:.4f}</p>
+            <p><strong>Peak:</strong> ${bot.peak_bankroll:.4f}</p>
+            <p><strong>Open Positions:</strong> {len(bot.positions)}</p>
             """
             self.wfile.write(html.encode())
 
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
-    logging.info(f"Dashboard running on port {HEALTH_PORT}")
+    logging.info(f"🌐 Dashboard running on http://0.0.0.0:{HEALTH_PORT}")
     server.serve_forever()
 
 
-# ==================== MAIN ====================
+# ==================== ENTRY POINT ====================
 async def main():
     bot = CopyTrader(dry_run=DRY_RUN)
     threading.Thread(target=run_dashboard, args=(bot,), daemon=True).start()
