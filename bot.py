@@ -874,75 +874,364 @@ def run_dashboard():
         def do_GET(self):
             self.send_response(200)
             if self.path == "/":
-                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 try:
-                    bankroll  = bot.balance.cached_balance
-                    open_pos  = [p for p in bot.positions.values() if p.status == "open"]
-                    def _upnl(p):
-                        if p.status == 'closed':
-                            return p.pnl
-                        # For open positions, use the stored pnl (unrealized)
-                        return p.pnl
-
-                    rows = "".join(
-                        f"<tr>"
-                        f"<td>{p.source_name}</td>"
-                        f"<td>{p.question[:50]}</td>"
-                        f"<td style='color:{'#4ade80' if p.side=='BUY' else '#f87171'}'>{p.side}</td>"
-                        f"<td>{p.outcome}</td>"
-                        f"<td>${p.size_usd:.2f}</td>"
-                        f"<td>{p.entry_price:.3f}</td>"
-                        f"<td>{p.current_price:.3f}如果"  # Added current price column
-                        f"<td>{p.order_type}</td>"
-                        f"<td>{p.status}</td>"
-                        f"<td style='color:{'#4ade80' if _upnl(p)>=0 else '#f87171'}'>${_upnl(p):+.2f}</td>"
-                        f"</table>"
-                        for p in bot.positions.values()
-                    )
+                    bankroll = bot.balance.cached_balance
+                    open_positions = [p for p in bot.positions.values() if p.status == "open"]
+                    closed_positions = [p for p in bot.positions.values() if p.status == "closed"]
+                    
+                    # Calculate total PnL
+                    total_pnl = sum(p.pnl for p in bot.positions.values())
+                    total_open_pnl = sum(p.pnl for p in open_positions)
+                    total_closed_pnl = sum(p.pnl for p in closed_positions)
+                    
+                    def get_pnl_color(pnl):
+                        if pnl > 0:
+                            return "#4ade80"  # green
+                        elif pnl < 0:
+                            return "#f87171"  # red
+                        return "#e0e0e0"  # white/gray
+                    
+                    def format_pnl(pnl):
+                        return f"${pnl:+.2f}"
+                    
+                    # Build table rows for open positions
+                    open_rows = ""
+                    for p in open_positions:
+                        # Calculate unrealized PnL properly
+                        if p.side == "BUY":
+                            unrealized_pnl = (p.current_price - p.entry_price) * p.shares
+                        else:
+                            unrealized_pnl = (p.entry_price - p.current_price) * p.shares
+                        
+                        pnl_color = get_pnl_color(unrealized_pnl)
+                        current_price_display = f"{p.current_price:.4f}" if p.current_price > 0 else "N/A"
+                        
+                        open_rows += f"""
+                        <tr>
+                            <td>{p.source_name}</td>
+                            <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
+                            <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
+                            <td>{p.outcome}</td>
+                            <td>${p.size_usd:.2f}</td>
+                            <td>{p.entry_price:.4f}</td>
+                            <td>{current_price_display}</td>
+                            <td>{p.order_type}</td>
+                            <td><span class="status-open">OPEN</span></td>
+                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(unrealized_pnl)}</td>
+                        </tr>
+                        """
+                    
+                    # Build table rows for closed positions
+                    closed_rows = ""
+                    for p in closed_positions:
+                        pnl_color = get_pnl_color(p.pnl)
+                        closed_rows += f"""
+                        <tr>
+                            <td>{p.source_name}</td>
+                            <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis;">{p.question[:60]}</td>
+                            <td style="color: {'#4ade80' if p.side == 'BUY' else '#f87171'}">{p.side}</td>
+                            <td>{p.outcome}</td>
+                            <td>${p.size_usd:.2f}</td>
+                            <td>{p.entry_price:.4f}</td>
+                            <td>{p.exit_price:.4f}</td>
+                            <td>{p.order_type}</td>
+                            <td><span class="status-closed">CLOSED</span></td>
+                            <td style="color: {pnl_color}; font-weight: bold;">{format_pnl(p.pnl)}</td>
+                        </tr>
+                        """
+                    
                     pause_str = (
-                        f"Paused until {bot_paused_until:%H:%M %d-%b}"
+                        f"Paused until {bot_paused_until.strftime('%H:%M %d-%b')}"
                         if bot_paused_until and datetime.now() < bot_paused_until
-                        else "Running"
+                        else "Active"
                     )
-                    html = f"""<!doctype html><html><head>
-                    <meta charset="utf-8">
-                    <title>CopyTrader</title>
-                    <meta http-equiv="refresh" content="30">
-                    <style>
-                      body{{font-family:monospace;padding:20px;background:#0d0d0d;color:#e0e0e0}}
-                      table{{border-collapse:collapse;width:100%}}
-                      th,td{{border:1px solid #333;padding:6px 10px;text-align:left}}
-                      th{{background:#1a1a1a}}
-                    </style>
-                    </head><body>
-                    <h2>CopyTrader — {pause_str}</h2>
-                    <p>Mode: <b>{'LIVE' if not bot.dry_run else 'DRY RUN'}</b> &nbsp;|&nbsp;
-                       Bankroll: <b>${bankroll:.4f}</b> &nbsp;|&nbsp;
-                       Peak: <b>${peak_bankroll:.4f}</b> &nbsp;|&nbsp;
-                       Open positions: <b>{len(open_pos)}</b></p>
-                    <table>
-                      <tr><th>Source</th><th>Market</th><th>Side</th>
-                          <th>Outcome</th><th>Size</th><th>Entry</th>
-                          <th>Current</th><th>Order</th><th>Status</th><th>PnL</th></tr>
-                      {rows if rows else "<tr><td colspan='10'>No positions</td></tr>"}
-                    </table>
-                    </body></html>"""
-                    self.wfile.write(html.encode())
+                    
+                    # Calculate drawdown
+                    drawdown_pct = 0
+                    if peak_bankroll > 0:
+                        drawdown_pct = ((peak_bankroll - bankroll) / peak_bankroll) * 100
+                    
+                    html = f"""<!DOCTYPE html>
+                    <html>
+                    <head>
+                        <meta charset="utf-8">
+                        <title>CopyTrader Dashboard</title>
+                        <meta http-equiv="refresh" content="30">
+                        <style>
+                            * {{
+                                margin: 0;
+                                padding: 0;
+                                box-sizing: border-box;
+                            }}
+                            body {{
+                                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                                padding: 20px;
+                                background: #0a0a0a;
+                                color: #e0e0e0;
+                            }}
+                            .container {{
+                                max-width: 1400px;
+                                margin: 0 auto;
+                            }}
+                            h1 {{
+                                color: #ffffff;
+                                margin-bottom: 20px;
+                                font-size: 28px;
+                                border-left: 4px solid #6366f1;
+                                padding-left: 15px;
+                            }}
+                            .stats {{
+                                display: grid;
+                                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                                gap: 15px;
+                                margin-bottom: 30px;
+                            }}
+                            .stat-card {{
+                                background: #1a1a1a;
+                                padding: 15px 20px;
+                                border-radius: 8px;
+                                border: 1px solid #2a2a2a;
+                            }}
+                            .stat-label {{
+                                font-size: 12px;
+                                text-transform: uppercase;
+                                color: #888;
+                                letter-spacing: 1px;
+                                margin-bottom: 8px;
+                            }}
+                            .stat-value {{
+                                font-size: 28px;
+                                font-weight: bold;
+                            }}
+                            .stat-value.positive {{
+                                color: #4ade80;
+                            }}
+                            .stat-value.negative {{
+                                color: #f87171;
+                            }}
+                            .stat-value.warning {{
+                                color: #fbbf24;
+                            }}
+                            .section {{
+                                background: #0f0f0f;
+                                border-radius: 8px;
+                                margin-bottom: 25px;
+                                border: 1px solid #1f1f1f;
+                                overflow: hidden;
+                            }}
+                            .section-header {{
+                                background: #1a1a1a;
+                                padding: 12px 20px;
+                                border-bottom: 1px solid #2a2a2a;
+                                font-weight: bold;
+                                font-size: 18px;
+                            }}
+                            .section-header span {{
+                                color: #6366f1;
+                            }}
+                            table {{
+                                width: 100%;
+                                border-collapse: collapse;
+                            }}
+                            th {{
+                                background: #141414;
+                                padding: 12px;
+                                text-align: left;
+                                font-size: 13px;
+                                font-weight: 600;
+                                color: #aaa;
+                                border-bottom: 1px solid #2a2a2a;
+                            }}
+                            td {{
+                                padding: 10px 12px;
+                                border-bottom: 1px solid #1f1f1f;
+                                font-size: 13px;
+                            }}
+                            tr:hover {{
+                                background: #151515;
+                            }}
+                            .badge {{
+                                display: inline-block;
+                                padding: 2px 8px;
+                                border-radius: 4px;
+                                font-size: 11px;
+                                font-weight: 600;
+                            }}
+                            .badge-active {{
+                                background: #064e3b;
+                                color: #4ade80;
+                            }}
+                            .badge-paused {{
+                                background: #7c2d12;
+                                color: #f97316;
+                            }}
+                            .status-open {{
+                                display: inline-block;
+                                padding: 2px 8px;
+                                border-radius: 4px;
+                                font-size: 11px;
+                                font-weight: 600;
+                                background: #1e3a5f;
+                                color: #60a5fa;
+                            }}
+                            .status-closed {{
+                                display: inline-block;
+                                padding: 2px 8px;
+                                border-radius: 4px;
+                                font-size: 11px;
+                                font-weight: 600;
+                                background: #3f3f46;
+                                color: #a1a1aa;
+                            }}
+                            .footer {{
+                                margin-top: 20px;
+                                text-align: center;
+                                color: #666;
+                                font-size: 12px;
+                            }}
+                            hr {{
+                                border: none;
+                                border-top: 1px solid #2a2a2a;
+                                margin: 20px 0;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>📊 Multi-Wallet Copy Trader</h1>
+                            
+                            <div class="stats">
+                                <div class="stat-card">
+                                    <div class="stat-label">Mode</div>
+                                    <div class="stat-value" style="font-size: 20px;">
+                                        <span class="badge {'badge-active' if not bot.dry_run else ''}" style="background: {'#064e3b' if not bot.dry_run else '#3f3f46'}; color: {'#4ade80' if not bot.dry_run else '#a1a1aa'}">
+                                            {'🔴 LIVE' if not bot.dry_run else '🟡 DRY RUN'}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Bot Status</div>
+                                    <div class="stat-value" style="font-size: 20px;">
+                                        <span class="badge {'badge-active' if pause_str == 'Active' else 'badge-paused'}">
+                                            {pause_str}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Bankroll</div>
+                                    <div class="stat-value">${bankroll:.2f}</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Peak Bankroll</div>
+                                    <div class="stat-value">${peak_bankroll:.2f}</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Drawdown</div>
+                                    <div class="stat-value {'warning' if drawdown_pct > 10 else ''}">{drawdown_pct:.1f}%</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Open Positions</div>
+                                    <div class="stat-value">{len(open_positions)}</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Total PnL</div>
+                                    <div class="stat-value {'positive' if total_pnl > 0 else 'negative' if total_pnl < 0 else ''}">
+                                        {format_pnl(total_pnl)}
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Open PnL (Unrealized)</div>
+                                    <div class="stat-value {'positive' if total_open_pnl > 0 else 'negative' if total_open_pnl < 0 else ''}">
+                                        {format_pnl(total_open_pnl)}
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Closed PnL (Realized)</div>
+                                    <div class="stat-value {'positive' if total_closed_pnl > 0 else 'negative' if total_closed_pnl < 0 else ''}">
+                                        {format_pnl(total_closed_pnl)}
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="section">
+                                <div class="section-header">
+                                    📈 Open Positions <span>({len(open_positions)})</span>
+                                </div>
+                                <div style="overflow-x: auto;">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Source</th>
+                                                <th>Market</th>
+                                                <th>Side</th>
+                                                <th>Outcome</th>
+                                                <th>Size</th>
+                                                <th>Entry</th>
+                                                <th>Current</th>
+                                                <th>Order</th>
+                                                <th>Status</th>
+                                                <th>Unrealized PnL</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {open_rows if open_rows else '<tr><td colspan="10" style="text-align:center; padding:40px;">📭 No open positions</td></tr>'}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            
+                            <div class="section">
+                                <div class="section-header">
+                                    📉 Closed Positions <span>({len(closed_positions)})</span>
+                                </div>
+                                <div style="overflow-x: auto;">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Source</th>
+                                                <th>Market</th>
+                                                <th>Side</th>
+                                                <th>Outcome</th>
+                                                <th>Size</th>
+                                                <th>Entry</th>
+                                                <th>Exit</th>
+                                                <th>Order</th>
+                                                <th>Status</th>
+                                                <th>Realized PnL</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {closed_rows if closed_rows else '<tr><td colspan="10" style="text-align:center; padding:40px;">📭 No closed positions</td></tr>'}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            
+                            <div class="footer">
+                                <hr>
+                                <p>🔄 Auto-refresh every 30 seconds | 📍 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                            </div>
+                        </div>
+                    </body>
+                    </html>"""
+                    
+                    self.wfile.write(html.encode('utf-8'))
                 except Exception as exc:
-                    self.wfile.write(f"Error: {exc}".encode())
+                    self.wfile.write(f"<html><body><h2>Error</h2><pre>{exc}</pre></body></html>".encode('utf-8'))
             else:
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"OK")
-
+        
         def do_HEAD(self):
             self.send_response(200)
             self.end_headers()
-
+        
         def log_message(self, format, *args):
             pass
-
+    
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
     logging.info(f"Dashboard on http://0.0.0.0:{HEALTH_PORT}")
     server.serve_forever()
